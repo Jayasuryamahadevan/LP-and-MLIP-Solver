@@ -1,5 +1,6 @@
 add_library(sihps_core STATIC
   bench/RunMetadata.cpp
+  bench/ResourceSnapshot.cpp
   memory/MemoryArena.cpp
   sparse/CSRMatrix.cpp
   sparse/CSCMatrix.cpp

@@ -15,6 +15,7 @@
 // regression gate.
 
 #include "bench/RunMetadata.hpp"
+#include "bench/ResourceSnapshot.hpp"
 #include "cuda/CudaDevice.hpp"
 #include "io/MpsReader.hpp"
 #include "io/NetlibReference.hpp"
@@ -33,46 +34,10 @@
 #include <string>
 #include <vector>
 
-#ifdef __linux__
-#include <sys/resource.h>
-#endif
-
 using namespace sihps;
 namespace fs = std::filesystem;
 
 namespace {
-
-struct ResourceSnapshot {
-    double cpu_seconds = 0.0;
-    long peak_rss_kb = 0;
-    bool gpu_available = false;
-    std::size_t gpu_free_bytes = 0;
-    std::size_t gpu_total_bytes = 0;
-};
-
-ResourceSnapshot resource_snapshot() {
-    ResourceSnapshot snapshot;
-#ifdef __linux__
-    struct rusage usage {};
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        snapshot.cpu_seconds = static_cast<double>(usage.ru_utime.tv_sec) +
-                               static_cast<double>(usage.ru_utime.tv_usec) / 1e6 +
-                               static_cast<double>(usage.ru_stime.tv_sec) +
-                               static_cast<double>(usage.ru_stime.tv_usec) / 1e6;
-        snapshot.peak_rss_kb = usage.ru_maxrss;
-    }
-#endif
-    try {
-        if (CudaDevice::device_count() > 0) {
-            snapshot.gpu_available = true;
-            CudaDevice::select(0);
-            CudaDevice::memory_info(snapshot.gpu_free_bytes, snapshot.gpu_total_bytes);
-        }
-    } catch (...) {
-        snapshot.gpu_available = false;
-    }
-    return snapshot;
-}
 
 // Relative-objective agreement threshold. Netlib's own primary values
 // carry ~10 significant digits, and its CPLEX/MINOS columns disagree with
@@ -108,6 +73,18 @@ int main(int argc, char** argv) {
     // argv[6]: path for the JSON Lines record. Every quoted number in this
     // project's documentation should be traceable to one of these files.
     const std::string jsonl_path = (argc > 6) ? argv[6] : "";
+    // argv[7]: how many times to solve EACH instance. Default 1 preserves
+    // every prior measurement's exact meaning (docs/measurements/*.jsonl
+    // predate this option and are all implicitly repeat_count=1); above 1,
+    // InstanceRecord.wall_seconds becomes the MEDIAN of that many solves
+    // (bench::Summary's own median convention: sorted[n/2]) with
+    // wall_seconds_min/max recorded alongside, so a later regression check
+    // can tell real change from run-to-run noise (docs/ROADMAP_STATUS.md
+    // Phase 0). Repeating also re-verifies this solver's stated
+    // determinism-under-fixed-configuration design goal for free: if two
+    // solves of the identical instance disagree on objective or iteration
+    // count, that is flagged, not averaged away.
+    const int repeats = (argc > 7) ? std::max(1, std::atoi(argv[7])) : 1;
     // SIHPS_PDLP_ADAPTIVE=0 disables the adaptive step size for the whole
     // sweep. An environment variable rather than another positional
     // argument because this exists to A/B one default, not to be a
@@ -115,7 +92,7 @@ int main(int argc, char** argv) {
     bool pdlp_adaptive = true;
     if (const char* e = std::getenv("SIHPS_PDLP_ADAPTIVE")) pdlp_adaptive = (std::atoi(e) != 0);
 
-    const ResourceSnapshot resources_before = resource_snapshot();
+    const bench::ResourceSnapshot resources_before = bench::capture_resources();
     const auto benchmark_start = std::chrono::steady_clock::now();
 
     const bench::RunMetadata meta = bench::RunMetadata::capture();
@@ -198,19 +175,42 @@ int main(int argc, char** argv) {
         }
 
         LpProblem p = lp_problem_from_mps(model);
+        LpSolverOptions options;
+        options.use_presolve = use_presolve;
+        if (hybrid) options.method = LpMethod::HYBRID;
+        options.pdlp.adaptive_step = pdlp_adaptive;
+
         LpSolution result;
-        auto t0 = std::chrono::steady_clock::now();
-        try {
-            LpSolverOptions options;
-            options.use_presolve = use_presolve;
-            if (hybrid) options.method = LpMethod::HYBRID;
-            options.pdlp.adaptive_step = pdlp_adaptive;
-            result = solve_lp(p, options);
-        } catch (const std::exception&) {
-            result.status = LpStatus::NUMERICAL_FAILURE;
+        std::vector<double> rep_seconds;
+        rep_seconds.reserve(static_cast<std::size_t>(repeats));
+        bool deterministic = true;
+        for (int rep = 0; rep < repeats; ++rep) {
+            LpSolution this_result;
+            const auto t0 = std::chrono::steady_clock::now();
+            try {
+                this_result = solve_lp(p, options);
+            } catch (const std::exception&) {
+                this_result.status = LpStatus::NUMERICAL_FAILURE;
+            }
+            rep_seconds.push_back(
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (rep == 0) {
+                result = this_result;
+            } else if (this_result.status != result.status ||
+                       this_result.iterations != result.iterations ||
+                       this_result.objective_value != result.objective_value) {
+                deterministic = false;
+            }
         }
-        const double secs =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::sort(rep_seconds.begin(), rep_seconds.end());
+        const double secs = rep_seconds[rep_seconds.size() / 2]; // median; single sample when repeats==1
+        const double secs_min = rep_seconds.front();
+        const double secs_max = rep_seconds.back();
+        if (!deterministic) {
+            std::printf("  WARNING: %s did not reproduce identically across %d repeats "
+                        "(status/iterations/objective differed)\n",
+                        name.c_str(), repeats);
+        }
 
         // Compare against the closest published value; report which one.
         double best_rel = 1e300;
@@ -239,6 +239,12 @@ int main(int argc, char** argv) {
                     result.objective_value, best_ref, best_rel, secs, result.iterations,
                     result.refactorizations, ok ? "PASS" : "FAIL", best_source.c_str(),
                     result.used_first_order ? " [first-order]" : "");
+        if (repeats > 1) {
+            std::printf("               (%d repeats: median %.3f s, min %.3f s, max %.3f s)\n",
+                        repeats, secs, secs_min, secs_max);
+        }
+
+        const bench::ResourceSnapshot after_instance = bench::capture_resources();
 
         bench::InstanceRecord rec;
         rec.instance_path = path.string();
@@ -253,6 +259,10 @@ int main(int argc, char** argv) {
         rec.passed = ok;
         rec.reference_source = best_source;
         rec.wall_seconds = secs;
+        rec.wall_seconds_min = secs_min;
+        rec.wall_seconds_max = secs_max;
+        rec.repeat_count = repeats;
+        rec.repeats_deterministic = deterministic;
         rec.presolve_seconds = result.presolve_seconds;
         rec.solve_seconds = result.solve_seconds;
         rec.iterations = result.iterations;
@@ -265,6 +275,13 @@ int main(int argc, char** argv) {
         rec.pdlp_host_syncs = result.pdlp.host_syncs;
         rec.presolve_removed_rows = result.presolve_removed_rows;
         rec.presolve_removed_cols = result.presolve_removed_cols;
+        rec.peak_rss_kb = after_instance.peak_rss_kb;
+        rec.gpu_available = after_instance.gpu_available;
+        if (after_instance.gpu_available) {
+            rec.gpu_used_mb = static_cast<double>(after_instance.gpu_total_bytes -
+                                                   after_instance.gpu_free_bytes) /
+                               (1024.0 * 1024.0);
+        }
         records.push_back(rec);
         if (writer) writer->write(rec);
     }
@@ -289,7 +306,7 @@ int main(int argc, char** argv) {
                 sum.median_seconds, sum.p95_seconds, sum.max_seconds);
     std::printf("total iterations %lld   worst relative objective error %.3e\n",
                 static_cast<long long>(sum.total_iterations), sum.worst_relative_objective_error);
-    const ResourceSnapshot resources_after = resource_snapshot();
+    const bench::ResourceSnapshot resources_after = bench::capture_resources();
     const double wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - benchmark_start).count();
     const double cpu_seconds =

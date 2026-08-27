@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 133 / 133 | `ctest` (128 pre-existing + 5 GMI-cut hand-verified cases) |
+| unit tests | 136 / 136 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot hand-verified cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -82,8 +82,8 @@ project came from measurements taken without recorded conditions (see
 | Instance hashing | `IMPLEMENTED` — FNV-1a 64 over file bytes |
 | Per-stage timers | `IMPLEMENTED` — `SimplexProfile`, 9 stages, `benchmarks/profile_simplex.cpp` |
 | Median / geometric mean / p95 summaries | `IMPLEMENTED` — `bench::summarize` |
-| Memory statistics | **NOT IMPLEMENTED** — peak RSS and peak VRAM are not captured |
-| Repeated-run support, median over runs | **NOT IMPLEMENTED** — each sweep runs once |
+| Memory statistics | `IMPLEMENTED`, `MEASURED` — `src/bench/ResourceSnapshot.{hpp,cpp}` (`InstanceRecord::peak_rss_kb`/`gpu_used_mb`), per-instance in `validate_netlib`'s JSONL. Peak RSS is the process's cumulative peak through that instance (`getrusage`'s own contract), not an isolated per-instance figure — stated in the header comment, not hidden |
+| Repeated-run support, median over runs | `IMPLEMENTED`, `MEASURED` — `validate_netlib`'s new optional 7th argument (repeat count, default 1 so every prior measurement's meaning is unchanged); `wall_seconds` becomes the median, `wall_seconds_min`/`max` recorded alongside. `docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`: full 90-instance sweep at 3 repeats, 100% bit-identical objective/iteration/status across every repeat on every instance — a real, MEASURED confirmation of this project's stated determinism-under-fixed-configuration goal (Phase 1), not merely an assumption |
 | Performance profile generation | **NOT IMPLEMENTED** |
 | Benchmark regression comparison | **NOT IMPLEMENTED** |
 | NVTX ranges | **NOT IMPLEMENTED** |
@@ -383,14 +383,24 @@ benchmark-ready, which is now the top item below.
    iteration moves to item 2 below rather than a third pass at MILP
    cuts against a set that includes a deliberately adversarial instance
    (`markshare2`) no cut approach reaches.
-2. **Peak RSS / VRAM capture and repeated-run medians** — the two Phase 0 gaps
-   that still let a regression hide. **Now the top item** — see above.
+2. ~~Peak RSS / VRAM capture and repeated-run medians~~ — **done.** Both
+   Phase 0 gaps now `IMPLEMENTED`, `MEASURED` (see the Phase 0 table
+   above): `src/bench/ResourceSnapshot.{hpp,cpp}` (shared, deduplicated
+   from what was previously two identical copies in
+   `validate_netlib.cpp`/`bench_miplib.cpp`), `validate_netlib`'s new
+   optional repeat-count argument, and a full 90-instance/3-repeat sweep
+   (`docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`) that
+   MEASURED 100% bit-identical determinism across every repeat of every
+   instance. **Now the top item: item 3 below.**
 3. **Generated adversarial LPs + Compute Sanitizer** — Phase 1's real
    acceptance criteria, currently only argued from Netlib.
 4. **Hyper-sparse FTRAN** (BTRAN is now done — `docs/architecture/LP.md`
    §9), then Markowitz/AMD ordering and presolve expansion.
 5. Feasibility polishing for the six stalling PDLP instances.
 6. Layer D refinery generator — without it, no refinery claim is admissible.
+7. Resume MILP cut work (§1 above, PAUSED not abandoned) with the
+   density-based hypothesis, once items 2-3 have made further correctness
+   infrastructure progress.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

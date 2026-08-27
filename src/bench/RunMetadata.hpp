@@ -70,7 +70,23 @@ struct InstanceRecord {
     bool passed = false;
     std::string reference_source;
 
+    // wall_seconds is the MEDIAN over repeat_count solves (identical to
+    // the single sample when repeat_count == 1, so every consumer written
+    // before repeated runs existed keeps reading exactly what it always
+    // read). wall_seconds_min/max bound the same sample set -- needed so
+    // a future regression check can tell real change from run-to-run
+    // noise, per docs/ROADMAP_STATUS.md's Phase 0 gap.
     double wall_seconds = 0.0;
+    double wall_seconds_min = 0.0;
+    double wall_seconds_max = 0.0;
+    std::int32_t repeat_count = 1;
+    // False if repeated solves of the SAME instance under the SAME
+    // configuration produced a different objective or iteration count --
+    // this solver's stated design goal is determinism under fixed
+    // configuration (docs/ROADMAP_STATUS.md Phase 1), so this is a
+    // correctness signal, not just a benchmarking curiosity. Meaningless
+    // (left true) when repeat_count == 1.
+    bool repeats_deterministic = true;
     double presolve_seconds = 0.0;
     double solve_seconds = 0.0;
     std::int32_t iterations = 0;
@@ -95,6 +111,14 @@ struct InstanceRecord {
 
     std::int32_t presolve_removed_rows = 0;
     std::int32_t presolve_removed_cols = 0;
+
+    // Resource usage captured once, after this instance finishes (see
+    // ResourceSnapshot.hpp for what "peak" means inside a multi-instance
+    // sweep: the process's cumulative peak through this point, not an
+    // isolated per-instance figure). Zero/false when not captured.
+    long peak_rss_kb = 0;
+    bool gpu_available = false;
+    double gpu_used_mb = 0.0;
 };
 
 // Solver configuration in force for a whole sweep.

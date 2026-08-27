@@ -227,24 +227,30 @@ void JsonlWriter::write(const InstanceRecord& r) {
                  "\"instance\":\"%s\",\"hash\":\"%s\",\"rows\":%d,\"cols\":%d,\"nnz\":%d,"
                  "\"status\":\"%s\",\"objective\":%s,\"reference_objective\":%s,"
                  "\"relative_objective_error\":%s,\"passed\":%s,\"reference_source\":\"%s\","
-                 "\"wall_seconds\":%s,\"presolve_seconds\":%s,\"solve_seconds\":%s,"
+                 "\"wall_seconds\":%s,\"wall_seconds_min\":%s,\"wall_seconds_max\":%s,"
+                 "\"repeat_count\":%d,\"repeats_deterministic\":%s,"
+                 "\"presolve_seconds\":%s,\"solve_seconds\":%s,"
                  "\"simplex_seconds\":%s,\"first_order_seconds\":%s,"
                  "\"iterations\":%d,\"refactorizations\":%d,"
                  "\"primal_residual\":%s,\"dual_residual\":%s,"
                  "\"used_first_order\":%s,\"first_order_fallback_used\":%s,"
                  "\"pdlp_iterations\":%d,\"pdlp_host_syncs\":%d,"
-                 "\"presolve_removed_rows\":%d,\"presolve_removed_cols\":%d}\n",
+                 "\"presolve_removed_rows\":%d,\"presolve_removed_cols\":%d,"
+                 "\"peak_rss_kb\":%ld,\"gpu_available\":%s,\"gpu_used_mb\":%s}\n",
                  esc(r.instance_path).c_str(), esc(r.instance_hash).c_str(), r.rows, r.cols, r.nnz,
                  esc(r.status).c_str(), num(r.objective).c_str(),
                  num(r.reference_objective).c_str(), num(r.relative_objective_error).c_str(),
                  r.passed ? "true" : "false", esc(r.reference_source).c_str(),
-                 num(r.wall_seconds).c_str(), num(r.presolve_seconds).c_str(),
+                 num(r.wall_seconds).c_str(), num(r.wall_seconds_min).c_str(),
+                 num(r.wall_seconds_max).c_str(), r.repeat_count,
+                 r.repeats_deterministic ? "true" : "false", num(r.presolve_seconds).c_str(),
                  num(r.solve_seconds).c_str(), num(r.simplex_seconds).c_str(),
                  num(r.first_order_seconds).c_str(), r.iterations, r.refactorizations,
                  num(r.primal_residual).c_str(), num(r.dual_residual).c_str(),
                  r.used_first_order ? "true" : "false",
                  r.first_order_fallback_used ? "true" : "false", r.pdlp_iterations,
-                 r.pdlp_host_syncs, r.presolve_removed_rows, r.presolve_removed_cols);
+                 r.pdlp_host_syncs, r.presolve_removed_rows, r.presolve_removed_cols,
+                 r.peak_rss_kb, r.gpu_available ? "true" : "false", num(r.gpu_used_mb).c_str());
     // Flushed per record so a sweep killed by a time limit still leaves
     // every finished instance on disk.
     std::fflush(f);

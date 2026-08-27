@@ -1,3 +1,4 @@
+#include "bench/ResourceSnapshot.hpp"
 #include "io/MpsReader.hpp"
 #include "milp/MilpProblem.hpp"
 #include "milp/MilpSolver.hpp"
@@ -18,10 +19,6 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef __linux__
-#include <sys/resource.h>
-#endif
-
 namespace fs = std::filesystem;
 
 namespace {
@@ -31,37 +28,9 @@ struct Reference {
     double objective = 0.0;
 };
 
-struct ResourceSnapshot {
-    double cpu_seconds = 0.0;
-    long peak_rss_kb = 0;
-    bool gpu_available = false;
-    std::size_t gpu_free_bytes = 0;
-    std::size_t gpu_total_bytes = 0;
-};
+using ResourceSnapshot = sihps::bench::ResourceSnapshot;
 
-ResourceSnapshot resources() {
-    ResourceSnapshot snapshot;
-#ifdef __linux__
-    struct rusage usage {};
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        snapshot.cpu_seconds = static_cast<double>(usage.ru_utime.tv_sec) +
-                               static_cast<double>(usage.ru_utime.tv_usec) / 1e6 +
-                               static_cast<double>(usage.ru_stime.tv_sec) +
-                               static_cast<double>(usage.ru_stime.tv_usec) / 1e6;
-        snapshot.peak_rss_kb = usage.ru_maxrss;
-    }
-#endif
-    try {
-        if (sihps::CudaDevice::device_count() > 0) {
-            snapshot.gpu_available = true;
-            sihps::CudaDevice::select(0);
-            sihps::CudaDevice::memory_info(snapshot.gpu_free_bytes, snapshot.gpu_total_bytes);
-        }
-    } catch (...) {
-        snapshot.gpu_available = false;
-    }
-    return snapshot;
-}
+ResourceSnapshot resources() { return sihps::bench::capture_resources(); }
 
 std::unordered_map<std::string, Reference> read_solution_file(const fs::path& path) {
     std::ifstream input(path);

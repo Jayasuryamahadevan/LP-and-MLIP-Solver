@@ -1,5 +1,6 @@
 add_executable(sihps_tests
   test_main.cpp
+  bench/test_resource_snapshot.cpp
   memory/test_memory_arena.cpp
   sparse/test_csr_csc.cpp
   sparse/test_parallel.cpp

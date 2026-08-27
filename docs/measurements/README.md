@@ -12,6 +12,8 @@ that every quoted number can be traced to the run that produced it.
 
 | `netlib-hybrid-20000rows.jsonl` | `validate_netlib data/netlib_lp/feasible data/netlib_readme.txt 20000 presolve hybrid <out.jsonl>` | 93/93 with `LpMethod::HYBRID`, with full reproducibility metadata (`NUMERICS.md` §3.2) |
 
+| `netlib-hybrid-20000rows-repeats3.jsonl` | `validate_netlib data/netlib_lp/feasible data/netlib_readme.txt 20000 presolve hybrid <out.jsonl> 3` | 90/90 (of 93 feasible instances with a published reference), each solved 3 times: 100% bit-identical status/iterations/objective across every repeat of every instance — MEASURED confirmation of determinism under fixed configuration (`ROADMAP_STATUS.md` Phase 0/1). Also the first file carrying per-instance `peak_rss_kb`/`gpu_used_mb` (`src/bench/ResourceSnapshot.hpp`) and `wall_seconds_min`/`max` |
+
 | `crossmethod-kennington.jsonl` | `validate_crossmethod data/netlib_lp/feasible data/netlib_readme.txt 60 presolve <out.jsonl>` | 21/21 Kennington + QAP solved, 0 objective disagreements; first-order 2.39× faster where both solved (`ROADMAP_STATUS.md`) |
 
 | `../highs_comparison.md` (+ `reports/highs_comparison/*`) | `benchmarks/compare_highs.py both --time-limit 60` | Head-to-head against HiGHS 1.15.1 built from source: HiGHS 7.25× faster in aggregate on 89 agreeing Netlib LPs; mixed 2-2-1 result on the 5-instance MIPLIB set; one objective disagreement (`e226`) diagnosed as a real, narrow MPS-format gap in this repo's parser (objective-row RHS constant not implemented), not a solver defect |
@@ -28,6 +30,16 @@ the exact file that produced it.
 
 JSONL rather than one JSON document, and flushed per record, so a sweep killed
 by a time limit still leaves valid parseable data for everything it finished.
+
+An optional **seventh** argument sets the repeat count per instance (default
+1, unchanged from every measurement predating this option). Above 1,
+`wall_seconds` becomes the median of that many solves, `wall_seconds_min`/
+`wall_seconds_max` bound the sample, and `repeats_deterministic` is `false`
+if any repeat disagreed on status/iterations/objective. Every record also
+carries `peak_rss_kb` and (when a GPU is present) `gpu_used_mb`, captured
+once after that instance finishes — `peak_rss_kb` is the process's
+cumulative peak *through* that instance (`getrusage`'s own contract, see
+`src/bench/ResourceSnapshot.hpp`), not an isolated per-instance figure.
 
 ## The one rule these files exist to enforce
 
