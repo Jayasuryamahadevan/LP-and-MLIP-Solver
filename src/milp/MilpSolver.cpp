@@ -956,6 +956,65 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
         }
     };
 
+    // RENS -- "Relaxation Enforced Neighborhood Search" (Berthold, "RENS --
+    // the optimal rounding", Mathematical Programming Computation 6(1),
+    // 2014). Distinct from both heuristics above: rounding_heuristic snaps
+    // the relaxation's integer columns to their nearest integer with NO
+    // re-solve; attempt_lp_dive fixes ONE fractional variable at a time
+    // with a full LP re-solve per step; RENS instead restricts EVERY
+    // integer-restricted column AT ONCE -- an already-integral one is
+    // FIXED there, a fractional one is bounded to its two nearest integers
+    // {floor, ceil} -- and re-solves the single resulting LP exactly once.
+    // The restricted LP's own feasible region already encodes "close to
+    // the relaxation, but integer-reachable"; unlike a full RENS this does
+    // NOT recurse into a sub-MIP when that one solve is still fractional --
+    // ENGINEERING TECHNIQUE, scoped down deliberately (see docs/
+    // architecture/MILP.md \S4 for why): a single LP solve is cheap and
+    // risk-free to try (a failed/fractional/infeasible result changes
+    // nothing, exactly like every other heuristic here), while a recursive
+    // sub-MIP is materially more machinery for a first increment. Root-only
+    // for the same reason attempt_local_improvement is root-only -- this is
+    // a single-shot heuristic, not a repeated search, so there is nothing
+    // to gain from re-invoking it at every node.
+    const auto attempt_rens = [&](const LpSolution& starting,
+                                  const std::vector<double>& starting_lower,
+                                  const std::vector<double>& starting_upper) {
+        if (!options.use_rens_heuristic) return;
+        if (integral_point(problem, starting.x, options.integrality_tolerance)) return;
+
+        std::vector<double> rens_lower = starting_lower;
+        std::vector<double> rens_upper = starting_upper;
+        for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
+            const auto jj = static_cast<std::size_t>(j);
+            if (problem.variable_types[jj] == VariableType::CONTINUOUS) continue;
+            const double value = starting.x[jj];
+            const double floor_value = std::floor(value);
+            const double ceil_value = std::ceil(value);
+            if (ceil_value - value <= options.integrality_tolerance ||
+                value - floor_value <= options.integrality_tolerance) {
+                const double fixed = std::round(value);
+                rens_lower[jj] = std::max(rens_lower[jj], fixed);
+                rens_upper[jj] = std::min(rens_upper[jj], fixed);
+            } else {
+                rens_lower[jj] = std::max(rens_lower[jj], floor_value);
+                rens_upper[jj] = std::min(rens_upper[jj], ceil_value);
+            }
+        }
+        if (!bounds_are_valid(rens_lower, rens_upper)) return;
+
+        LpProblem restricted = workspace;
+        restricted.lower = std::move(rens_lower);
+        restricted.upper = std::move(rens_upper);
+        ++solution.lp_relaxations;
+        ++solution.rens_heuristic_lp_relaxations;
+        const LpSolution restricted_solution = solve_lp(restricted, relaxation_options);
+        if (restricted_solution.status != LpStatus::OPTIMAL ||
+            restricted_solution.x.size() != static_cast<std::size_t>(problem.n_cols())) {
+            return;
+        }
+        consider_incumbent(restricted_solution.x, starting_lower, starting_upper);
+    };
+
     while (!open.empty()) {
         if (timed_out()) {
             solution.status = MilpStatus::TIME_LIMIT;
@@ -1121,6 +1180,18 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
         }
 
         if (candidate_integral) continue;
+
+        // RENS first: one cheap LP solve, tried before the (potentially
+        // many-solve) dive below so a successful RENS candidate lets the
+        // dive's own `!isfinite(incumbent)` guard skip it entirely.
+        if (node->depth == 0) {
+            attempt_rens(relaxation, lower, upper);
+            if (timed_out()) {
+                open.push(node);
+                solution.status = MilpStatus::TIME_LIMIT;
+                break;
+            }
+        }
 
         // Dive at the root and at only the first few levels when no
         // incumbent exists. Repeating a failed dive at every deep node can

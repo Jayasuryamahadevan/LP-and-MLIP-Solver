@@ -407,10 +407,25 @@ std::vector<Constraint> break_symmetry(const std::vector<SymmetryGroup>& declare
 
 ## 4. Primal Heuristics and Incumbent Management
 
-The implementation includes a safe rounding heuristic: integer variables are
-rounded and the resulting point is accepted only after a fresh original-model
-feasibility and integrality check. A failed heuristic never changes the
-search state. RENS, feasibility pump, and diving heuristics remain deferred.
+Four heuristics are implemented, all routing any candidate through the same
+single acceptance gate, `consider_incumbent` (`src/milp/MilpSolver.cpp`) —
+a fresh original-model feasibility and integrality check against
+`problem.relaxation` (never the internal, possibly-cut-augmented workspace).
+A failed heuristic never changes the search state:
+
+- **Rounding** (`use_rounding_heuristic`, default on): every processed node,
+  zero-cost — snaps each non-continuous column's relaxation value with
+  `std::round` (no LP re-solve) and checks the gate.
+- **LP diving** (`use_diving_heuristic`, default on): root and shallow
+  depths only, while no incumbent yet exists — fixes one fractional
+  variable at a time toward the objective-preferred side and re-solves the
+  full LP at each step, up to `diving_max_depth`/`diving_max_lp_relaxations`.
+- **Local improvement** (`use_local_improvement`, default on): root only,
+  after an incumbent exists — a 1-flip RINS-like neighborhood search that
+  fixes every other integer variable at the incumbent's value and perturbs
+  one at a time.
+- **RENS** (`use_rens_heuristic`, default **off** — §4.2 below).
+
 Incumbent management is a single global best-solution record, single-writer,
 with no concurrency primitives; the B&B control loop is single-threaded.
 
@@ -429,6 +444,71 @@ with no concurrency primitives; the B&B control loop is single-threaded.
   `UNBOUNDED_RELAXATION`, not as a proof that the MILP itself is unbounded.
 - MPS `INTORG`/`INTEND`, `LI`, `UI`, `BV`, and `OBJSENSE MAX` metadata are
   preserved by the parser and converted into the MILP model contract.
+
+### 4.2 RENS — implemented, tested, MEASURED not to help on this benchmark, off by default
+
+`IMPLEMENTED`, `MEASURED`. RENS ("Relaxation Enforced Neighborhood Search,"
+Berthold, *Mathematical Programming Computation* 6(1), 2014) fixes every
+column that is already integral in the current LP relaxation, restricts
+every fractional column to `{floor, ceil}`, and re-solves the single
+resulting LP once — distinct from both diving (one variable at a time,
+full LP re-solve per step) and local improvement (fixes everything at the
+*incumbent*, not the relaxation, and only perturbs one variable). Root-only,
+tried before diving in the node loop (`attempt_rens`, `src/milp/
+MilpSolver.cpp`) so a cheap single-solve success lets diving's own
+`!isfinite(incumbent)` guard skip entirely.
+
+**Deliberately scoped down**, stated explicitly: this is single-shot, not
+the fully recursive form (solving the restricted problem as its own bounded
+sub-MIP when one LP resolve is still fractional). A failed/fractional/
+infeasible result changes nothing, exactly like every other heuristic here,
+so the single solve is cheap and risk-free to attempt regardless.
+
+**A hand-verified "RENS finds a specific better point" unit test was
+attempted and deliberately not included** — this is itself a documented
+finding. For any LP relaxation with a *unique* optimum, that optimal point
+satisfies `floor(v) <= v <= ceil(v)` in every coordinate by definition, so
+it remains feasible — and therefore still optimal — in RENS's own
+box-restricted re-solve; several independent hand-constructed cases (a
+single fractional variable against a singleton row, two simultaneously
+fractional variables against two crossing rows, a three-way tied-objective
+knapsack row) all confirmed this directly rather than by argument alone.
+The *only* mechanism by which single-shot RENS can return something
+different from the raw relaxation is genuine solver tie-breaking on a
+**degenerate** (multiple-optimum) restricted LP — an implementation detail
+of this project's own simplex pivoting, not something provable by
+construction, and this project's specific pivoting was observed to break a
+constructed 3-way tie identically in both the original and restricted
+problem.
+
+**MEASURED**, `bench_miplib`, single process, nothing else running, 60s
+budget, all 5 instances, flag off vs. on (with the now-default `enable_
+integer_bound_rounding=true` active in both runs): the found incumbent
+objective was **bit-identical on every single instance** either way
+(`gen-ip002` -4783.73, `gen-ip054` 6853.27, `markshare2` 231, `neos859080`
+0/infeasible, `pk1` 44) — a genuine, honest null result, not a bug. This is
+consistent with the theoretical argument above: the existing rounding/
+diving/local-improvement heuristics already capture what this solver's
+deterministic pivoting makes reachable, and binary variables (`markshare2`,
+`pk1`) get zero restriction benefit from RENS at all, since `{floor, ceil}`
+of any fractional value in `(0,1)` is `[0,1]` — their native domain already.
+Default stays `false`, matching GMI cuts' own precedent for a
+correct-but-unmeasured-benefit reduction (§2.2) rather than warm-started
+node relaxations' precedent of a measured net *loss* (§1.4) — RENS is
+neither: it simply never fires differently than the existing heuristics on
+this benchmark.
+
+**`RESEARCH HYPOTHESIS` for a future attempt**: the two documented paths to
+real RENS value are (a) the fully recursive form (bound a small sub-MIP
+solve on the restricted problem rather than accepting only an outright-
+integral single resolve), which could reach the many real RENS successes
+reported in the literature that rely on searching the restricted region, not
+just re-solving it once, or (b) running RENS at additional nodes beyond the
+root, where accumulated branching bounds create genuinely different
+(non-degenerate-in-the-same-way) restricted sub-problems than the root's
+own. Neither attempted here, per this session's practice of shipping one
+well-scoped increment and measuring it honestly rather than guessing at a
+larger design's payoff in advance.
 
 ## 5. GPU Involvement Inside a Node (restated boundary)
 

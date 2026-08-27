@@ -168,6 +168,94 @@ SIHPS_TEST(milp_integer_bound_rounding_certifies_a_single_row_root_without_branc
     SIHPS_ASSERT_TRUE(with.nodes_processed < without.nodes_processed);
 }
 
+// --- RENS heuristic (Berthold 2014): mechanism/wiring correctness ------
+//
+// A hand-verified "RENS finds a specific better point" fixture is
+// deliberately NOT included here -- and that omission is itself a
+// documented finding, not an oversight. For any LP relaxation with a
+// UNIQUE optimum, the original optimal point always satisfies
+// floor(v) <= v <= ceil(v) in every coordinate, so it remains feasible
+// (and therefore still optimal) in RENS's own box-restricted re-solve --
+// a single-shot, non-recursive RENS can only ever return something
+// DIFFERENT from the raw relaxation via genuine solver tie-breaking on a
+// DEGENERATE (multi-optimum) restricted LP, which is an implementation
+// detail of this project's own pivoting, not something provable by
+// construction. MEASURED via bench_miplib (single process, flag off vs.
+// on, all 5 instances): the found incumbent objective was BIT-IDENTICAL
+// on every instance either way -- a genuine, honest null result on this
+// benchmark, not a bug (see docs/architecture/MILP.md \S4 for the full
+// account and the mathematical argument above). Default stays `false`,
+// matching GMI cuts' own precedent for a correct-but-unmeasured-benefit
+// reduction.
+
+SIHPS_TEST(milp_rens_heuristic_is_off_by_default) {
+    MilpProblem problem = single_row_l_type_integer(); // 2x<=7, fractional root
+    MilpSolverOptions options;
+    options.lp_options.use_presolve = false; // isolate RENS from presolve's own rounding
+    options.use_rounding_heuristic = false;
+    options.use_diving_heuristic = false;
+    options.use_local_improvement = false;
+    options.enable_root_cover_cuts = false;
+    options.enable_root_gmi_cuts = false;
+    options.enable_integer_bound_rounding = false;
+    options.node_limit = 1; // root only: nothing but a heuristic can produce an incumbent here
+    const auto result = sihps::solve_milp(problem, options);
+
+    // use_rens_heuristic left at its default (false) throughout `options`.
+    SIHPS_ASSERT_TRUE(!result.has_incumbent);
+    SIHPS_ASSERT_EQ(static_cast<int>(result.rens_heuristic_lp_relaxations), 0);
+}
+
+// A relaxation that is already integer-feasible (here: x hits its own
+// bound of 5 directly, not derived fractionally) must make RENS a no-op
+// -- attempt_rens's own integral_point() guard returns before spending
+// any LP solve, which rens_heuristic_lp_relaxations == 0 verifies
+// directly rather than just inferring it from the final answer.
+SIHPS_TEST(milp_rens_heuristic_is_a_noop_when_the_root_relaxation_is_already_integral) {
+    LpProblem lp;
+    lp.A = CSRMatrix::from_triplets(1, 1, {Triplet{0, 0, 1.0}});
+    lp.obj = {-1.0}; // maximize x
+    lp.rhs = {100.0}; // loose row -- x's own upper bound (5) binds instead
+    lp.row_types = {'L'};
+    lp.lower = {0.0};
+    lp.upper = {5.0};
+    sihps::apply_default_row_bounds(lp);
+    MilpProblem problem{std::move(lp), {VariableType::INTEGER}};
+
+    MilpSolverOptions options;
+    options.lp_options.use_presolve = false;
+    options.use_rens_heuristic = true;
+    options.node_limit = 1;
+    const auto result = sihps::solve_milp(problem, options);
+
+    SIHPS_ASSERT_TRUE(result.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_TRUE(result.has_incumbent);
+    SIHPS_ASSERT_NEAR(result.x[0], 5.0, 0.0);
+    SIHPS_ASSERT_EQ(static_cast<int>(result.rens_heuristic_lp_relaxations), 0);
+}
+
+// Enabling RENS must never change the final CERTIFIED answer, even though
+// (per the measurement above) it typically finds nothing new on top of
+// the existing heuristics -- run to full completion (no node limit),
+// RENS off vs. on, same problem: identical status, objective, and
+// solution vector either way.
+SIHPS_TEST(milp_rens_heuristic_does_not_change_the_final_certified_optimum) {
+    MilpSolverOptions off;
+    off.use_rens_heuristic = false;
+    const auto without = sihps::solve_milp(binary_knapsack(), off);
+
+    MilpSolverOptions on = off;
+    on.use_rens_heuristic = true;
+    const auto with = sihps::solve_milp(binary_knapsack(), on);
+
+    SIHPS_ASSERT_TRUE(without.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_TRUE(with.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_NEAR(without.objective_value, with.objective_value, 1e-8);
+    SIHPS_ASSERT_NEAR(with.objective_value, -10.0, 1e-8);
+    SIHPS_ASSERT_NEAR(with.x[0], without.x[0], 0.0);
+    SIHPS_ASSERT_NEAR(with.x[1], without.x[1], 0.0);
+}
+
 SIHPS_TEST(milp_reports_maximization_objective_in_original_sense) {
     auto problem = binary_knapsack();
     problem.maximize = true;

@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 152 / 152 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding cases: 5 presolve-level hand-derived, 1 MILP-level "certifies without branching", 1 infeasibility-without-branching) |
+| unit tests | 155 / 155 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding cases + 3 RENS wiring/non-corruption cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -564,9 +564,29 @@ benchmark-ready, which is now the top item below.
    coefficient tightening / GCD-based reductions — the natural next
    increment, particularly for `markshare2`'s integer-valued matrix
    coefficients — and clique merging/dual fixing are not attempted here.
-   **Now the top item**: coefficient tightening / GCD-based reductions, or
-   a RENS-class primal heuristic (`docs/research/HIGHS_GAP_ANALYSIS.md`
-   §7 item 3) — both unattempted, neither touches `factorize()`.
+   ~~**Now the top item**: coefficient tightening / GCD-based reductions,
+   or a RENS-class primal heuristic~~ — **RENS: done, MEASURED, off by
+   default (genuine null result, not a bug).** Implemented single-shot
+   RENS (Berthold 2014: fix already-integral relaxation columns, restrict
+   fractional ones to `{floor, ceil}`, re-solve once), root-only, tried
+   before diving. `bench_miplib` flag off vs. on, all 5 instances: found
+   incumbent objective **bit-identical on every instance either way** — a
+   real, measured non-improvement. Root-caused, not just observed: proved
+   that for any LP relaxation with a *unique* optimum, that point always
+   satisfies `floor(v) <= v <= ceil(v)` in every coordinate, so it remains
+   feasible (hence still optimal) in RENS's own restricted re-solve —
+   single-shot RENS can only ever return something different via genuine
+   solver tie-breaking on a degenerate restricted LP, and this project's
+   own pivoting was observed to break a constructed 3-way tie identically
+   in both the original and restricted problem. Binary variables get zero
+   restriction benefit at all (`{floor,ceil}` of any fractional value in
+   `(0,1)` is `[0,1]`, their native domain). Full account, including the
+   `RESEARCH HYPOTHESIS` for a future recursive or multi-node attempt:
+   `docs/architecture/MILP.md` §4.2. Stays off by default, matching GMI
+   cuts' own precedent for a correct-but-unmeasured-benefit reduction.
+   **Now the top item**: coefficient tightening / GCD-based reductions
+   (`markshare2`'s integer-valued matrix coefficients), still unattempted
+   and not gated by `factorize()`'s hot path.
 9. Presolve expansion (doubleton, aggregation) for plain LP (Phase 2 table
    above) — confirmed genuinely unimplemented, benefits both LP and every
    MILP node relaxation, doesn't touch `factorize()`'s hot path directly

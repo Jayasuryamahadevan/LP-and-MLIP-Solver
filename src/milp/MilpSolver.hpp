@@ -42,6 +42,16 @@ struct MilpSolverOptions {
     bool use_local_improvement = true;
     std::uint32_t local_improvement_passes = 3;
     std::uint32_t local_improvement_max_trials = 128;
+    // RENS (Berthold 2014): root-only, one restricted LP solve -- fixes
+    // every already-integral relaxation column, bounds every fractional
+    // one to {floor, ceil}, and checks whether the single re-solve is
+    // integer-feasible outright. Distinct from both heuristics above (see
+    // src/milp/MilpSolver.cpp's attempt_rens for the exact difference).
+    // Default false pending a KPI-gate benchmark on bench_miplib, matching
+    // this project's own rule (enable_root_gmi_cuts, and
+    // enable_integer_bound_rounding before its own KPI gate cleared): a
+    // heuristic ships off by default until MEASURED to help.
+    bool use_rens_heuristic = false;
     MilpBranchingRule branching_rule = MilpBranchingRule::RELIABILITY;
     std::uint32_t reliability_threshold = 2;
     std::uint32_t strong_branching_candidates = 4;
@@ -119,6 +129,7 @@ struct MilpSolution {
     std::uint64_t incumbent_updates = 0;
     std::uint64_t diving_heuristic_lp_relaxations = 0;
     std::uint64_t local_improvement_lp_relaxations = 0;
+    std::uint64_t rens_heuristic_lp_relaxations = 0;
 
     // Populated only when warm_start_node_relaxations is true: how many
     // non-root node relaxations actually took the warm path, and how many
