@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 136 / 136 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot hand-verified cases) |
+| unit tests | 142 / 142 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot + 6 adversarial-LP cases, the last covering 400 generated instances) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -102,14 +102,57 @@ only, and not across runs.
 | Presolve on/off differential testing | `IMPLEMENTED` — `validate_netlib … nopresolve` |
 | CPU/GPU differential testing | `IMPLEMENTED` — bit-identical assertions across thread counts and backends |
 | Determinism under fixed configuration | `MEASURED` — exact-equality tests, including PDLP |
-| Random / ill-conditioned / degenerate LP generators | **NOT IMPLEMENTED** |
-| MPS and sparse-structure fuzzing | **NOT IMPLEMENTED** |
-| Compute Sanitizer in CI | **NOT IMPLEMENTED** — never run |
-| Brute-force checker for tiny MILPs | **NOT APPLICABLE YET** — no MILP engine |
+| Random / ill-conditioned / degenerate LP generators | `IMPLEMENTED`, `MEASURED` — `tests/lp/adversarial_lp_generator.hpp` + `tests/lp/test_adversarial.cpp`, see below |
+| MPS and sparse-structure fuzzing | **NOT IMPLEMENTED** — the generator above builds `LpProblem` directly, not MPS text; a text-level MPS fuzzer is a distinct, still-open item |
+| Compute Sanitizer in CI | **NOT IMPLEMENTED** — never run. Deliberately deferred out of this pass (recorded, not dropped): the generator work below was already one coherent increment, and Compute Sanitizer is independent enough to be its own |
+| Brute-force checker for tiny MILPs | `IMPLEMENTED` — this line was stale; `tests/milp/test_milp.cpp` has brute-forceable tiny-MILP cases (integer optima, infeasibility proofs) since the MILP engine landed |
 
-`KNOWN LIMITATION`: "no false INFEASIBLE" and "no false UNBOUNDED" are asserted
-against the Netlib infeasible set (28/0/1) and the feasible set, not against
-generated adversarial cases. That is weaker evidence than the roadmap asks for.
+`MEASURED`: 6 generator categories (feasible/bounded, ill-conditioned,
+degenerate, infeasible-by-bounds, infeasible-by-rows, unbounded), each with
+a TRUE status known by construction (not by trusting any solver — see the
+generator's own file header for the closed/bounded/nonempty-polytope
+argument), seeded and deterministic. 400 generated instances total across
+6 test cases, every accepted OPTIMAL independently re-verified in the test
+file itself (recomputing bound/row feasibility and the objective from `x`
+directly — not merely trusting `LpSolution`'s own residual fields):
+
+| category | instances | result |
+|---|---|---|
+| feasible/bounded | 80 | 80/80 OPTIMAL, 80/80 independently verified (tol 1e-6) |
+| ill-conditioned (coefficients 1e-6..1e6) | 60 | 60/60 correct status (never false INFEASIBLE/UNBOUNDED), 60/60 independently verified within a relaxed 1e-4 tolerance (conditioning bounds achievable accuracy for correct code too, not only buggy code) |
+| degenerate (redundant/duplicate rows) | 80 | 80/80 OPTIMAL, 80/80 independently verified (tol 1e-6) |
+| infeasible (bound contradiction) | 60 | 60/60 correctly detected INFEASIBLE |
+| infeasible (row contradiction) | 60 | 60/60 correctly detected INFEASIBLE |
+| unbounded (zero column, negative cost, no upper bound) | 60 | 60/60 correctly detected UNBOUNDED |
+
+**One real bug found and fixed during this work — in the test generator,
+not the solver.** The degenerate-LP generator's row-duplication loop
+copied a source row's `rhs`/`row_types` from an up-to-date, incrementally
+mutated array, but copied that same row's *coefficients* from a fixed
+snapshot of the original matrix that was never rebuilt mid-loop. When a
+duplication's source row had itself already been overwritten by an
+earlier duplication in the same loop, this produced a row whose `rhs` and
+coefficients came from two different points in time — an inequality no
+point actually satisfied, i.e. a genuinely corrupted instance, not the
+guaranteed-feasible one the generator claimed to produce. It surfaced as
+an unexplained `INFEASIBLE` in `test_adversarial.cpp`; isolated with a
+standalone reproduction (not guessed), confirmed by hand-checking the
+corrupted row's coefficients against the known feasible point (activity
+`-582.04` against a required RHS of `129.23` — no accuracy issue, an
+actually-different linear constraint), and fixed by keeping row content
+in one consistently-mutated structure instead of two independently-mutated
+ones. This is exactly the outcome Phase 1 correctness infrastructure is
+for — it does not matter that the bug was in the harness rather than the
+solver; a fuzzer whose own instances are corrupted is worse than no
+fuzzer, since it would have quietly recorded false “solver failures.”
+
+`KNOWN LIMITATION` (unchanged by the above, restated precisely): the
+solver-under-test claims themselves ("no false INFEASIBLE", "no false
+UNBOUNDED") are now backed by 400 generated adversarial instances in
+addition to the Netlib set (28/0/1 known-infeasible/unbounded/feasible),
+which is real, new, stronger evidence — but MPS-text-level fuzzing and
+Compute Sanitizer remain open, so this is not yet the roadmap's full
+Phase 1 acceptance bar.
 
 `KNOWN LIMITATION`, `MEASURED` via `docs/measurements/highs_comparison.md`:
 `src/io/MpsReader.cpp` does not implement the MPS objective-row RHS
@@ -392,8 +435,15 @@ benchmark-ready, which is now the top item below.
    (`docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`) that
    MEASURED 100% bit-identical determinism across every repeat of every
    instance. **Now the top item: item 3 below.**
-3. **Generated adversarial LPs + Compute Sanitizer** — Phase 1's real
-   acceptance criteria, currently only argued from Netlib.
+3. **Generated adversarial LPs — done; Compute Sanitizer — still open.**
+   400 generated instances across 6 categories (feasible/bounded,
+   ill-conditioned, degenerate, infeasible×2, unbounded), all with a
+   status known by construction, independently re-verified in the test
+   itself; found and fixed one real bug (in the generator, not the
+   solver — see the Phase 1 table above for the full account). Compute
+   Sanitizer (memcheck/racecheck against a GPU-exercising benchmark) was
+   deliberately deferred, not attempted — explicitly recorded as **now
+   the top item** rather than silently dropped.
 4. **Hyper-sparse FTRAN** (BTRAN is now done — `docs/architecture/LP.md`
    §9), then Markowitz/AMD ordering and presolve expansion.
 5. Feasibility polishing for the six stalling PDLP instances.

@@ -14,6 +14,7 @@ add_executable(sihps_tests
   lp/test_presolve.cpp
   lp/test_scaling.cpp
   lp/test_simplex.cpp
+  lp/test_adversarial.cpp
   milp/test_milp.cpp
 )
 
