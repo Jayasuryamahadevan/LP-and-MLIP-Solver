@@ -1,0 +1,18 @@
+{
+  "highs_version": "HiGHS version 1.15.1 Githash 73cac48. Copyright (c) 2026 under MIT licence terms\nIncludes third-party software components, see THIRD_PARTY_NOTICES.md for full details",
+  "git_commit": "4f83aa2 (dirty)",
+  "instances_compared": 90,
+  "both_optimal_and_agree": 89,
+  "objective_disagreements": [
+    [
+      "e226",
+      0.5627850292430913
+    ]
+  ],
+  "solved_only_by_ours": [],
+  "solved_only_by_highs": [],
+  "total_wall_seconds_ours": 92.850677135,
+  "total_wall_seconds_highs": 12.8,
+  "per_instance_wins_ours": 11,
+  "per_instance_wins_highs": 78
+}

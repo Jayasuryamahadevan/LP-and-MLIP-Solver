@@ -111,6 +111,21 @@ only, and not across runs.
 against the Netlib infeasible set (28/0/1) and the feasible set, not against
 generated adversarial cases. That is weaker evidence than the roadmap asks for.
 
+`KNOWN LIMITATION`, `MEASURED` via `docs/measurements/highs_comparison.md`:
+`src/io/MpsReader.cpp` does not implement the MPS objective-row RHS
+constant (a value on the RHS line for the objective/`N` row is a valid,
+if uncommon, way to encode a constant term in the objective; HiGHS's own
+parser implements this, `highs/io/HMpsFF.cpp:1081`). A full scan of the
+Netlib feasible set found exactly one instance affected (`e226`,
+constant `7.113`) out of 114 — narrow, not systemic — and this repo's
+current (no-offset) behavior happens to match `data/netlib_readme.txt`'s
+own published reference for that instance, so nothing here was silently
+wrong on the existing validated set. Next concrete step: add an
+`obj_offset` field to `MpsModel`/`LpProblem`, apply it when constructing
+the reported objective in both `LpSolver.cpp` and `MilpSolver.cpp`, and
+add a unit test against a small hand-built model with a nonzero
+objective-row RHS.
+
 ---
 
 ## Phase 2 — high-performance LP core

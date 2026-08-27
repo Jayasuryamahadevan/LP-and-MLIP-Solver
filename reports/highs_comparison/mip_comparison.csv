@@ -1,0 +1,6 @@
+instance,reference_objective,ours_status,ours_objective,ours_nodes,ours_seconds,highs_status,highs_objective,highs_nodes,highs_seconds
+gen-ip002,-4783.733392,TIME_LIMIT,-4783.7333916,293131,60.114,Time limit reached,-4772.258675,75293,60.0
+gen-ip054,6840.96564179,TIME_LIMIT,6857.870745784001,234062,60.084,Time limit reached,6858.26290606,319855,60.0
+markshare2,1.0,TIME_LIMIT,231.0,707680,60.091,Time limit reached,41.0,102803,60.0
+neos859080,0.0,INFEASIBLE,0.0,331,0.868,Infeasible,inf,1102,1.29
+pk1,11.0,TIME_LIMIT,44.0,118934,60.038,Time limit reached,14.0,147515,60.0

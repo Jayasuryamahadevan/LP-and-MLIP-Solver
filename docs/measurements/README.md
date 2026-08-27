@@ -14,6 +14,8 @@ that every quoted number can be traced to the run that produced it.
 
 | `crossmethod-kennington.jsonl` | `validate_crossmethod data/netlib_lp/feasible data/netlib_readme.txt 60 presolve <out.jsonl>` | 21/21 Kennington + QAP solved, 0 objective disagreements; first-order 2.39× faster where both solved (`ROADMAP_STATUS.md`) |
 
+| `../highs_comparison.md` (+ `reports/highs_comparison/*`) | `benchmarks/compare_highs.py both --time-limit 60` | Head-to-head against HiGHS 1.15.1 built from source: HiGHS 7.25× faster in aggregate on 89 agreeing Netlib LPs; mixed 2-2-1 result on the 5-instance MIPLIB set; one objective disagreement (`e226`) diagnosed as a real, narrow MPS-format gap in this repo's parser (objective-row RHS constant not implemented), not a solver defect |
+
 ## Structured records
 
 `validate_netlib` takes an optional sixth argument: a path for a **JSON Lines**

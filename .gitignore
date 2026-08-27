@@ -1,0 +1,7 @@
+build/
+Highs.log
+
+# Third-party reference solvers pulled for benchmarking only (see
+# benchmarks/compare_highs.py). Never committed, never edited -- built
+# fresh from upstream source each time it's needed.
+external/

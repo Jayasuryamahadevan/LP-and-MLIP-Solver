@@ -1,0 +1,268 @@
+<title>SIHPS vs HiGHS</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --axis:           #c3c2b7;
+    --series-1:       #2a78d6; /* ours */
+    --series-2:       #eb6834; /* HiGHS */
+    --good:           #0ca30c;
+    --border:         rgba(11,11,11,0.10);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --axis:           #383835;
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+      --good:           #0ca30c;
+      --border:         rgba(255,255,255,0.10);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --axis:           #383835;
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --good:           #0ca30c;
+    --border:         rgba(255,255,255,0.10);
+  }
+
+  body { margin: 0; background: var(--page); }
+  .viz-root { background: var(--page); padding: 28px 16px 40px; box-sizing: border-box; }
+  .wrap { max-width: 940px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+
+  h1 { font-size: 19px; font-weight: 650; color: var(--text-primary); margin: 0 0 2px; }
+  .sub { font-size: 13px; color: var(--text-secondary); margin: 0; line-height: 1.55; }
+  .sub code { background: var(--grid); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 20px 12px;
+    box-sizing: border-box;
+  }
+  .card-title { font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 0 0 2px; }
+  .card-note { font-size: 12px; color: var(--text-muted); margin: 0 0 12px; line-height: 1.5; }
+
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axis-line { stroke: var(--axis); stroke-width: 1; }
+  .tick-label { fill: var(--text-muted); font-size: 10.5px; }
+  .axis-title { fill: var(--text-secondary); font-size: 11.5px; }
+  .parity { stroke: var(--axis); stroke-width: 1.5; stroke-dasharray: 4 4; }
+  .dot { fill: var(--series-1); fill-opacity: 0.75; }
+  .dot-above { fill: var(--series-2); fill-opacity: 0.75; }
+
+  .legend { display: flex; gap: 18px; align-items: center; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 10px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 7px; }
+  .swatch { width: 10px; height: 10px; border-radius: 50%; }
+  .swatch.sq { border-radius: 3px; }
+
+  .tooltip {
+    position: absolute; pointer-events: none; opacity: 0; transition: opacity 0.08s;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; color: var(--text-primary);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.12); white-space: nowrap; z-index: 5;
+  }
+  .chart-pos { position: relative; }
+
+  .stat-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 4px; }
+  .stat { background: var(--page); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; min-width: 120px; }
+  .stat-value { font-size: 20px; font-weight: 650; color: var(--text-primary); }
+  .stat-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); color: var(--text-primary); }
+  th:first-child, td:first-child { text-align: left; color: var(--text-secondary); }
+  th { font-weight: 600; color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: 0.02em; }
+  td.win { color: var(--good); font-weight: 600; }
+
+  .foot { font-size: 11.5px; color: var(--text-muted); line-height: 1.6; }
+</style>
+
+<div class="viz-root">
+  <div class="wrap">
+    <div>
+      <h1>SIHPS vs HiGHS 1.15.1</h1>
+      <p class="sub">
+        Native HiGHS (MIT licence, ERGO-Code/HiGHS), built unmodified from source and run only through its own CLI &mdash;
+        never wrapped, edited, or linked into this repo's solver. Single process, same machine (RTX 3050 Laptop, 16 threads).
+        Reproduce: <code>python3 benchmarks/compare_highs.py both --time-limit 60</code>. Full account:
+        <code>docs/measurements/highs_comparison.md</code>.
+      </p>
+    </div>
+
+    <div class="card">
+      <p class="card-title">LP: per-instance solve time, 89 Netlib instances both solvers agree on</p>
+      <p class="card-note">Log-log axes. Points below the dashed parity line: ours faster. Above: HiGHS faster. HiGHS's own printed timer rounds coarsely for very fast instances, which is why many points cluster at its floor.</p>
+      <div class="stat-row">
+        <div class="stat"><div class="stat-value">7.25&times;</div><div class="stat-label">HiGHS faster, aggregate wall-clock</div></div>
+        <div class="stat"><div class="stat-value">78 / 11</div><div class="stat-label">per-instance wins, HiGHS / ours</div></div>
+        <div class="stat"><div class="stat-value">89 / 90</div><div class="stat-label">objective agreement (1 explained, see doc)</div></div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch" style="background:var(--series-1)"></span>ours faster (below line)</div>
+        <div class="legend-item"><span class="swatch" style="background:var(--series-2)"></span>HiGHS faster (above line)</div>
+      </div>
+      <div class="chart-pos" id="chart1-pos">
+        <svg id="chart1" viewBox="0 0 880 420" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="tooltip" id="tip1"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="card-title">MILP: relative gap to true optimum, 5-instance MIPLIB set, 60s budget</p>
+      <p class="card-note">Lower is better. Neither solver certifies (proves) any of the 5 within budget &mdash; this compares incumbent quality only. <code>neos859080</code> (infeasible) omitted here: both solvers proved it correctly, ours in 0.87s vs HiGHS's 1.29s.</p>
+      <div class="chart-pos" id="chart2-pos">
+        <svg id="chart2" viewBox="0 0 880 260" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="tooltip" id="tip2"></div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch sq" style="background:var(--series-1)"></span>ours</div>
+        <div class="legend-item"><span class="swatch sq" style="background:var(--series-2)"></span>HiGHS</div>
+      </div>
+      <table>
+        <thead><tr><th>instance</th><th>reference</th><th>ours</th><th>HiGHS</th><th>ahead</th></tr></thead>
+        <tbody>
+          <tr><td>gen-ip002</td><td>-4783.73</td><td class="win">-4783.73</td><td>-4772.26</td><td class="win">ours (exact optimum)</td></tr>
+          <tr><td>gen-ip054</td><td>6840.97</td><td>6857.87</td><td>6858.26</td><td>~tie (ours closer)</td></tr>
+          <tr><td>markshare2</td><td>1</td><td>231</td><td class="win">41</td><td class="win">HiGHS</td></tr>
+          <tr><td>neos859080</td><td>infeasible</td><td class="win">0.87s</td><td>1.29s</td><td class="win">ours (faster proof)</td></tr>
+          <tr><td>pk1</td><td>11</td><td>44</td><td class="win">14</td><td class="win">HiGHS</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="foot">
+      Verdict: HiGHS is faster on LP in aggregate (mature, decades-tuned simplex) and stronger on 2 of 5 MILP instances
+      (deeper cut/heuristic arsenal). This repo's solver matches HiGHS's LP objectives on 89/90 instances, proves the
+      same infeasibility faster on the one case tested, and found a strictly better MILP incumbent on one instance.
+      No aggregate superiority claim is made for either LP speed or MILP certification &mdash; see the doc for the full,
+      unhedged account, including the one objective disagreement (<code>e226</code>) and its diagnosed cause.
+    </p>
+  </div>
+</div>
+
+<script>
+const lpPoints = [{"name": "afiro", "ours": 0.000102613, "highs": 0.0001}, {"name": "sc50b", "ours": 0.000259368, "highs": 0.0001}, {"name": "sc50a", "ours": 0.000222218, "highs": 0.0001}, {"name": "kb2", "ours": 0.000256053, "highs": 0.0001}, {"name": "sc105", "ours": 0.000792061, "highs": 0.0001}, {"name": "adlittle", "ours": 0.000641138, "highs": 0.0001}, {"name": "stocfor1", "ours": 0.000577718, "highs": 0.0001}, {"name": "blend", "ours": 0.000746506, "highs": 0.0001}, {"name": "scagr7", "ours": 0.00115725, "highs": 0.0001}, {"name": "sc205", "ours": 0.003103355, "highs": 0.0001}, {"name": "share2b", "ours": 0.000943217, "highs": 0.0001}, {"name": "recipe", "ours": 0.000411815, "highs": 0.0001}, {"name": "lotfi", "ours": 0.001839014, "highs": 0.0001}, {"name": "vtp.base", "ours": 0.000619427, "highs": 0.0001}, {"name": "share1b", "ours": 0.002435056, "highs": 0.0001}, {"name": "boeing2", "ours": 0.001456894, "highs": 0.0001}, {"name": "bore3d", "ours": 0.001440974, "highs": 0.0001}, {"name": "scorpion", "ours": 0.004588482, "highs": 0.0001}, {"name": "capri", "ours": 0.00598391, "highs": 0.0001}, {"name": "brandy", "ours": 0.0058028, "highs": 0.01}, {"name": "sctap1", "ours": 0.005012842, "highs": 0.0001}, {"name": "scagr25", "ours": 0.013448479, "highs": 0.01}, {"name": "israel", "ours": 0.00254312, "highs": 0.0001}, {"name": "scfxm1", "ours": 0.007743816, "highs": 0.01}, {"name": "bandm", "ours": 0.011943715, "highs": 0.01}, {"name": "e226", "ours": 0.005900914, "highs": 0.01}, {"name": "grow7", "ours": 0.00405625, "highs": 0.01}, {"name": "etamacro", "ours": 0.010717847, "highs": 0.01}, {"name": "agg", "ours": 0.001071217, "highs": 0.0001}, {"name": "finnis", "ours": 0.007135289, "highs": 0.0001}, {"name": "scsd1", "ours": 0.003545047, "highs": 0.0001}, {"name": "standata", "ours": 0.003725537, "highs": 0.01}, {"name": "beaconfd", "ours": 0.001026974, "highs": 0.0001}, {"name": "stair", "ours": 0.022523572, "highs": 0.01}, {"name": "gfrd-pnc", "ours": 0.019025314, "highs": 0.01}, {"name": "standmps", "ours": 0.009017103, "highs": 0.01}, {"name": "scrs8", "ours": 0.022070609, "highs": 0.01}, {"name": "boeing1", "ours": 0.010701316, "highs": 0.01}, {"name": "modszk1", "ours": 0.066401886, "highs": 0.01}, {"name": "tuff", "ours": 0.008225403, "highs": 0.01}, {"name": "degen2", "ours": 0.051984801, "highs": 0.01}, {"name": "forplan", "ours": 0.006090201, "highs": 0.01}, {"name": "agg2", "ours": 0.002423174, "highs": 0.01}, {"name": "agg3", "ours": 0.002715234, "highs": 0.0001}, {"name": "shell", "ours": 0.014910183, "highs": 0.01}, {"name": "scfxm2", "ours": 0.026939259, "highs": 0.02}, {"name": "pilot4", "ours": 0.062325879, "highs": 0.02}, {"name": "scsd6", "ours": 0.013980301, "highs": 0.01}, {"name": "ship04s", "ours": 0.00535726, "highs": 0.01}, {"name": "seba", "ours": 0.014450708, "highs": 0.0001}, {"name": "grow15", "ours": 0.039010876, "highs": 0.03}, {"name": "fffff800", "ours": 0.023119775, "highs": 0.01}, {"name": "bnl1", "ours": 0.054191377, "highs": 0.02}, {"name": "perold", "ours": 0.232533318, "highs": 0.05}, {"name": "scfxm3", "ours": 0.056894538, "highs": 0.02}, {"name": "ship04l", "ours": 0.012500264, "highs": 0.01}, {"name": "ganges", "ours": 0.053108688, "highs": 0.01}, {"name": "sctap2", "ours": 0.048740571, "highs": 0.01}, {"name": "grow22", "ours": 0.091833555, "highs": 0.06}, {"name": "ship08s", "ours": 0.010417742, "highs": 0.01}, {"name": "maros", "ours": 0.065335998, "highs": 0.03}, {"name": "stocfor2", "ours": 0.145361302, "highs": 0.02}, {"name": "25fv47", "ours": 0.335420081, "highs": 0.11}, {"name": "ship12s", "ours": 0.018379898, "highs": 0.01}, {"name": "scsd8", "ours": 0.035676646, "highs": 0.03}, {"name": "fit1p", "ours": 0.100046765, "highs": 0.03}, {"name": "sctap3", "ours": 0.117826151, "highs": 0.01}, {"name": "sierra", "ours": 0.026576706, "highs": 0.01}, {"name": "pilotnov", "ours": 0.356438438, "highs": 0.11}, {"name": "czprob", "ours": 0.060594327, "highs": 0.02}, {"name": "fit1d", "ours": 0.02002154, "highs": 0.01}, {"name": "ship08l", "ours": 0.032443687, "highs": 0.02}, {"name": "bnl2", "ours": 0.635079659, "highs": 0.04}, {"name": "nesm", "ours": 0.241850617, "highs": 0.12}, {"name": "cycle", "ours": 0.245754329, "highs": 0.18}, {"name": "ship12l", "ours": 0.069103263, "highs": 0.02}, {"name": "degen3", "ours": 3.144972071, "highs": 0.13}, {"name": "greenbea", "ours": 10.631015321, "highs": 0.17}, {"name": "greenbeb", "ours": 6.981093125, "highs": 0.3}, {"name": "80bau3b", "ours": 0.68932082, "highs": 0.1}, {"name": "d2q06c", "ours": 12.30866333, "highs": 0.56}, {"name": "woodw", "ours": 0.463121894, "highs": 0.06}, {"name": "d6cube", "ours": 10.267739735, "highs": 0.1}, {"name": "pilot", "ours": 11.939417178, "highs": 0.8}, {"name": "dfl001", "ours": 2.191130234, "highs": 5.03}, {"name": "wood1p", "ours": 0.032906178, "highs": 0.05}, {"name": "fit2p", "ours": 1.103536752, "highs": 0.84}, {"name": "pilot87", "ours": 25.982281383, "highs": 2.76}, {"name": "fit2d", "ours": 2.717070754, "highs": 0.11}, {"name": "maros-r7", "ours": 0.805656044, "highs": 0.55}];
+
+function buildScatter() {
+  const svg = document.getElementById('chart1');
+  const tip = document.getElementById('tip1');
+  const W = 880, H = 420;
+  const marginL = 56, marginR = 20, marginT = 16, marginB = 44;
+  const plotW = W - marginL - marginR, plotH = H - marginT - marginB;
+
+  const allVals = lpPoints.flatMap(p => [p.ours, p.highs]);
+  const lo = Math.min(...allVals) * 0.7;
+  const hi = Math.max(...allVals) * 1.4;
+  const logLo = Math.log10(lo), logHi = Math.log10(hi);
+  const xPos = v => marginL + plotW * (Math.log10(v) - logLo) / (logHi - logLo);
+  const yPos = v => marginT + plotH * (1 - (Math.log10(v) - logLo) / (logHi - logLo));
+
+  let s = '';
+  const ticks = [0.0001, 0.001, 0.01, 0.1, 1, 10, 100];
+  ticks.forEach(t => {
+    if (t < lo || t > hi) return;
+    const x = xPos(t), y = yPos(t);
+    s += `<line class="gridline" x1="${marginL}" y1="${y}" x2="${W-marginR}" y2="${y}"/>`;
+    s += `<line class="gridline" x1="${x}" y1="${marginT}" x2="${x}" y2="${H-marginB}"/>`;
+    s += `<text class="tick-label" x="${marginL-8}" y="${y+3}" text-anchor="end">${t}</text>`;
+    s += `<text class="tick-label" x="${x}" y="${H-marginB+14}" text-anchor="middle">${t}</text>`;
+  });
+  s += `<line class="axis-line" x1="${marginL}" y1="${H-marginB}" x2="${W-marginR}" y2="${H-marginB}"/>`;
+  s += `<line class="axis-line" x1="${marginL}" y1="${marginT}" x2="${marginL}" y2="${H-marginB}"/>`;
+  s += `<line class="parity" x1="${xPos(lo)}" y1="${yPos(lo)}" x2="${xPos(hi)}" y2="${yPos(hi)}"/>`;
+  s += `<text class="axis-title" x="${marginL+plotW/2}" y="${H-6}" text-anchor="middle">HiGHS seconds (log)</text>`;
+  s += `<text class="axis-title" transform="translate(16 ${marginT+plotH/2}) rotate(-90)" text-anchor="middle">ours seconds (log)</text>`;
+
+  lpPoints.forEach(p => {
+    const cls = p.ours <= p.highs ? 'dot' : 'dot-above';
+    s += `<circle class="${cls}" cx="${xPos(p.highs).toFixed(2)}" cy="${yPos(p.ours).toFixed(2)}" r="4.5" data-name="${p.name}" data-ours="${p.ours}" data-highs="${p.highs}"/>`;
+  });
+  svg.innerHTML = s;
+
+  const posDiv = document.getElementById('chart1-pos');
+  svg.querySelectorAll('circle').forEach(c => {
+    c.addEventListener('mouseenter', () => {
+      const name = c.getAttribute('data-name');
+      const ours = parseFloat(c.getAttribute('data-ours'));
+      const highs = parseFloat(c.getAttribute('data-highs'));
+      tip.innerHTML = `<b>${name}</b><br>ours: ${ours.toFixed(4)}s &middot; HiGHS: ${highs.toFixed(4)}s`;
+      tip.style.opacity = 1;
+      const rect = posDiv.getBoundingClientRect();
+      const cx = parseFloat(c.getAttribute('cx')), cy = parseFloat(c.getAttribute('cy'));
+      const sx = rect.width / W, sy = rect.height / H;
+      tip.style.left = Math.min(cx * sx + 10, rect.width - 160) + 'px';
+      tip.style.top = Math.max(cy * sy - 40, 0) + 'px';
+    });
+    c.addEventListener('mouseleave', () => { tip.style.opacity = 0; });
+  });
+}
+
+function buildMipBars() {
+  const svg = document.getElementById('chart2');
+  const W = 880, H = 260;
+  const marginL = 90, marginR = 20, marginT = 16, marginB = 40;
+  const plotW = W - marginL - marginR, plotH = H - marginT - marginB;
+
+  const data = [
+    {name: 'gen-ip002', ref: -4783.733392, ours: -4783.7333916, highs: -4772.258675},
+    {name: 'gen-ip054', ref: 6840.96564179, ours: 6857.870745784, highs: 6858.26290606},
+    {name: 'markshare2', ref: 1.0, ours: 231.0, highs: 41.0},
+    {name: 'pk1', ref: 11.0, ours: 44.0, highs: 14.0},
+  ];
+  data.forEach(d => {
+    d.oursGap = Math.abs(d.ours - d.ref) / (1 + Math.abs(d.ref));
+    d.highsGap = Math.abs(d.highs - d.ref) / (1 + Math.abs(d.ref));
+  });
+  const maxGap = Math.max(...data.flatMap(d => [d.oursGap, d.highsGap])) * 1.15;
+
+  const rowH = plotH / data.length;
+  const xPos = v => marginL + plotW * (v / maxGap);
+
+  let s = '';
+  const xTicks = [0, 0.25, 0.5, 0.75, 1.0].filter(t => t <= maxGap || t === 0);
+  [0, maxGap * 0.25, maxGap * 0.5, maxGap * 0.75, maxGap].forEach(t => {
+    const x = xPos(t);
+    s += `<line class="gridline" x1="${x}" y1="${marginT}" x2="${x}" y2="${H-marginB}"/>`;
+    s += `<text class="tick-label" x="${x}" y="${H-marginB+14}" text-anchor="middle">${(t*100).toFixed(0)}%</text>`;
+  });
+  s += `<text class="axis-title" x="${marginL+plotW/2}" y="${H-4}" text-anchor="middle">relative gap to true optimum</text>`;
+  s += `<line class="axis-line" x1="${marginL}" y1="${marginT}" x2="${marginL}" y2="${H-marginB}"/>`;
+
+  data.forEach((d, i) => {
+    const yTop = marginT + i * rowH;
+    const barH = rowH * 0.32;
+    const y1 = yTop + rowH * 0.18;
+    const y2 = yTop + rowH * 0.54;
+    s += `<rect x="${marginL}" y="${y1}" width="${(xPos(d.oursGap)-marginL).toFixed(1)}" height="${barH}" fill="var(--series-1)" rx="3"/>`;
+    s += `<rect x="${marginL}" y="${y2}" width="${(xPos(d.highsGap)-marginL).toFixed(1)}" height="${barH}" fill="var(--series-2)" rx="3"/>`;
+    s += `<text class="tick-label" x="${marginL-10}" y="${yTop+rowH/2+4}" text-anchor="end" style="font-size:12px;fill:var(--text-secondary)">${d.name}</text>`;
+  });
+  svg.innerHTML = s;
+}
+
+buildScatter();
+buildMipBars();
+</script>
