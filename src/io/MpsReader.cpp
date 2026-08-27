@@ -23,6 +23,38 @@ std::vector<std::string> tokenize(const std::string& line) {
     return tokens;
 }
 
+// A handful of classic Netlib files (dfl001, forplan, gfrd-pnc, sierra,
+// blend) rely on strict fixed-column MPS layout: row/column names may
+// contain embedded blanks (e.g. "BR   1 1"), and the optional vector-name
+// field on RHS/RANGES/BOUNDS lines may be blank rather than absent. Both
+// break whitespace tokenization, which cannot tell an embedded blank in a
+// name from a field separator. Fields are extracted at the standard fixed
+// columns (1-indexed 2-3, 5-12, 15-22, 25-36, 40-47, 50-61) and used only as
+// a fallback when free-format parsing of the whole file fails.
+struct FixedFields {
+    std::string f1, f2, f3, f4, f5, f6;
+};
+
+std::string fixed_field(const std::string& line, std::size_t start, std::size_t len) {
+    if (start >= line.size()) return "";
+    std::string field = line.substr(start, std::min(len, line.size() - start));
+    std::size_t b = field.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    std::size_t e = field.find_last_not_of(" \t\r\n");
+    return field.substr(b, e - b + 1);
+}
+
+FixedFields tokenize_fixed(const std::string& line) {
+    FixedFields f;
+    f.f1 = fixed_field(line, 1, 2);
+    f.f2 = fixed_field(line, 4, 8);
+    f.f3 = fixed_field(line, 14, 8);
+    f.f4 = fixed_field(line, 24, 12);
+    f.f5 = fixed_field(line, 39, 8);
+    f.f6 = fixed_field(line, 49, 12);
+    return f;
+}
+
 std::string normalized_token(std::string token) {
     if (token.size() >= 2 && token.front() == '\'' && token.back() == '\'') {
         token = token.substr(1, token.size() - 2);
@@ -42,22 +74,34 @@ bool is_section_header(const std::string& line, const std::string& first_token) 
 
 } // namespace
 
-MpsModel read_mps_file(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("MpsReader: cannot open file: " + path);
-    }
-
+// `fixed_format` selects between whitespace tokenization (the common case)
+// and strict fixed-column field extraction (the fallback for files whose
+// row/column names contain embedded blanks, or that leave the optional
+// RHS/RANGES/BOUNDS vector-name field blank). Both produce the same
+// (name, value) pairs per data line; only how those pairs are extracted
+// from the raw line differs.
+MpsModel parse_mps_lines(const std::vector<std::string>& lines, bool fixed_format) {
     MpsModel model;
     std::unordered_map<std::string, std::int32_t> row_index; // L/G/E rows only
     std::unordered_set<std::string> declared_rows;            // every row, including extra N rows
     std::unordered_map<std::string, std::int32_t> col_index;
     std::vector<bool> has_explicit_lower; // tracks LO/FX/FR/MI/BV, for the negative-UP convention
     std::string section;
-    std::string line;
     bool integer_section = false;
 
-    while (std::getline(in, line)) {
+    auto parse_double = [](const std::string& s, const std::string& what) -> double {
+        try {
+            std::size_t consumed = 0;
+            double v = std::stod(s, &consumed);
+            if (consumed != s.size()) throw std::invalid_argument("trailing characters");
+            return v;
+        } catch (const std::exception&) {
+            throw std::runtime_error("MpsReader: expected a numeric " + what + ", got '" + s +
+                                      "'");
+        }
+    };
+
+    for (const std::string& line : lines) {
         if (line.empty() || line[0] == '*') {
             continue;
         }
@@ -75,11 +119,21 @@ MpsModel read_mps_file(const std::string& path) {
         }
 
         if (section == "ROWS") {
-            if (tokens.size() < 2) {
+            std::string type, name;
+            if (fixed_format) {
+                FixedFields f = tokenize_fixed(line);
+                type = f.f1;
+                name = f.f2;
+            } else {
+                if (tokens.size() < 2) {
+                    throw std::runtime_error("MpsReader: malformed ROWS line: " + line);
+                }
+                type = tokens[0];
+                name = tokens[1];
+            }
+            if (name.empty()) {
                 throw std::runtime_error("MpsReader: malformed ROWS line: " + line);
             }
-            const std::string& type = tokens[0];
-            const std::string& name = tokens[1];
             declared_rows.insert(name);
 
             if (type == "N") {
@@ -101,7 +155,9 @@ MpsModel read_mps_file(const std::string& path) {
         } else if (section == "COLUMNS") {
             // Free-format MPS integer markers are commonly written as
             // `MARK0000 'MARKER' 'INTORG'` and `MARK0001 'MARKER'
-            // 'INTEND'. They are records, not columns.
+            // 'INTEND'. They are records, not columns. None of the files
+            // that need the fixed-column fallback use markers, so this
+            // check is safe to run unconditionally on whitespace tokens.
             if (tokens.size() >= 3 && normalized_token(tokens[1]) == "MARKER") {
                 const std::string marker = normalized_token(tokens[2]);
                 if (marker == "INTORG") {
@@ -113,10 +169,27 @@ MpsModel read_mps_file(const std::string& path) {
                 }
                 continue;
             }
-            if (tokens.size() < 3) {
+
+            std::string col_name;
+            std::vector<std::pair<std::string, std::string>> pairs;
+            if (fixed_format) {
+                FixedFields f = tokenize_fixed(line);
+                col_name = f.f2;
+                if (!f.f3.empty()) pairs.push_back({f.f3, f.f4});
+                if (!f.f5.empty()) pairs.push_back({f.f5, f.f6});
+            } else {
+                if (tokens.size() < 3) {
+                    throw std::runtime_error("MpsReader: malformed COLUMNS line: " + line);
+                }
+                col_name = tokens[0];
+                for (std::size_t k = 1; k + 1 < tokens.size(); k += 2) {
+                    pairs.push_back({tokens[k], tokens[k + 1]});
+                }
+            }
+            if (col_name.empty()) {
                 throw std::runtime_error("MpsReader: malformed COLUMNS line: " + line);
             }
-            const std::string& col_name = tokens[0];
+
             std::int32_t c;
             auto cit = col_index.find(col_name);
             if (cit == col_index.end()) {
@@ -137,17 +210,16 @@ MpsModel read_mps_file(const std::string& path) {
                 }
             }
 
-            for (std::size_t k = 1; k + 1 < tokens.size(); k += 2) {
-                const std::string& row_name = tokens[k];
-                const double value = std::stod(tokens[k + 1]);
-
+            for (const auto& pr : pairs) {
+                const std::string& row_name = pr.first;
                 if (row_name == model.objective_row_name) {
-                    model.obj[static_cast<std::size_t>(c)] = value;
+                    model.obj[static_cast<std::size_t>(c)] = parse_double(pr.second, "COLUMNS value");
                     continue;
                 }
                 auto rit = row_index.find(row_name);
                 if (rit != row_index.end()) {
-                    model.constraint_triplets.push_back({rit->second, c, value});
+                    model.constraint_triplets.push_back(
+                        {rit->second, c, parse_double(pr.second, "COLUMNS value")});
                     continue;
                 }
                 if (declared_rows.count(row_name)) {
@@ -157,44 +229,44 @@ MpsModel read_mps_file(const std::string& path) {
                                           row_name);
             }
 
-        } else if (section == "RHS") {
-            if (model.rhs.empty() && model.n_rows > 0) {
+        } else if (section == "RHS" || section == "RANGES") {
+            std::vector<std::pair<std::string, std::string>> pairs;
+            if (fixed_format) {
+                FixedFields f = tokenize_fixed(line);
+                if (!f.f3.empty()) pairs.push_back({f.f3, f.f4});
+                if (!f.f5.empty()) pairs.push_back({f.f5, f.f6});
+            } else {
+                // The vector-name field (field 2) is skipped unconditionally
+                // here because every currently-passing free-format file
+                // supplies it; files that leave it blank fail this pass and
+                // are re-parsed in fixed_format mode instead.
+                for (std::size_t k = 1; k + 1 < tokens.size(); k += 2) {
+                    pairs.push_back({tokens[k], tokens[k + 1]});
+                }
+            }
+
+            if (section == "RHS" && model.rhs.empty() && model.n_rows > 0) {
                 model.rhs.assign(static_cast<std::size_t>(model.n_rows), 0.0);
             }
-            for (std::size_t k = 1; k + 1 < tokens.size(); k += 2) {
-                const std::string& row_name = tokens[k];
-                const double value = std::stod(tokens[k + 1]);
 
+            for (const auto& pr : pairs) {
+                const std::string& row_name = pr.first;
                 if (row_name == model.objective_row_name) {
                     continue; // objective constant shift; not used by anything yet
                 }
                 auto rit = row_index.find(row_name);
-                if (rit != row_index.end()) {
-                    model.rhs[static_cast<std::size_t>(rit->second)] = value;
-                    continue;
-                }
-                if (declared_rows.count(row_name)) {
-                    continue; // RHS entry for a dropped free row
-                }
-                throw std::runtime_error("MpsReader: RHS references undeclared row: " + row_name);
-            }
-
-        } else if (section == "RANGES") {
-            for (std::size_t k = 1; k + 1 < tokens.size(); k += 2) {
-                const std::string& row_name = tokens[k];
-                const double value = std::stod(tokens[k + 1]);
-
-                if (row_name == model.objective_row_name) {
-                    continue;
-                }
-                auto rit = row_index.find(row_name);
                 if (rit == row_index.end()) {
-                    if (declared_rows.count(row_name)) continue;
-                    throw std::runtime_error("MpsReader: RANGES references undeclared row: " +
-                                              row_name);
+                    if (declared_rows.count(row_name)) continue; // dropped free row
+                    throw std::runtime_error("MpsReader: " + section +
+                                              " references undeclared row: " + row_name);
                 }
-                model.row_range[static_cast<std::size_t>(rit->second)] = value;
-                model.has_range[static_cast<std::size_t>(rit->second)] = true;
+                const double value = parse_double(pr.second, section + " value");
+                if (section == "RHS") {
+                    model.rhs[static_cast<std::size_t>(rit->second)] = value;
+                } else {
+                    model.row_range[static_cast<std::size_t>(rit->second)] = value;
+                    model.has_range[static_cast<std::size_t>(rit->second)] = true;
+                }
             }
 
         } else if (section == "OBJSENSE") {
@@ -208,18 +280,34 @@ MpsModel read_mps_file(const std::string& path) {
             }
 
         } else if (section == "BOUNDS") {
-            if (tokens.size() < 3) {
+            std::string type, col_name, value_str;
+            bool has_value = false;
+            if (fixed_format) {
+                FixedFields f = tokenize_fixed(line);
+                type = f.f1;
+                col_name = f.f3;
+                has_value = !f.f4.empty();
+                value_str = f.f4;
+            } else {
+                if (tokens.size() < 3) {
+                    throw std::runtime_error("MpsReader: malformed BOUNDS line: " + line);
+                }
+                type = tokens[0];
+                col_name = tokens[2];
+                has_value = tokens.size() >= 4;
+                if (has_value) value_str = tokens[3];
+            }
+            if (col_name.empty()) {
                 throw std::runtime_error("MpsReader: malformed BOUNDS line: " + line);
             }
-            const std::string& type = tokens[0];
-            const std::string& col_name = tokens[2];
+
             auto cit = col_index.find(col_name);
             if (cit == col_index.end()) {
                 throw std::runtime_error("MpsReader: BOUNDS references undeclared column: " +
                                           col_name);
             }
             const auto c = static_cast<std::size_t>(cit->second);
-            const double value = (tokens.size() >= 4) ? std::stod(tokens[3]) : 0.0;
+            const double value = has_value ? parse_double(value_str, "BOUNDS value") : 0.0;
 
             if (type == "UP") {
                 model.col_upper[c] = value;
@@ -273,6 +361,27 @@ MpsModel read_mps_file(const std::string& path) {
     }
 
     return model;
+}
+
+MpsModel read_mps_file(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("MpsReader: cannot open file: " + path);
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) {
+        lines.push_back(line);
+    }
+
+    try {
+        return parse_mps_lines(lines, /*fixed_format=*/false);
+    } catch (const std::exception&) {
+        // A handful of classic Netlib files need strict fixed-column MPS
+        // parsing (see parse_mps_lines' comment); retry once before giving
+        // up so a genuinely malformed file still surfaces its real error.
+        return parse_mps_lines(lines, /*fixed_format=*/true);
+    }
 }
 
 } // namespace sihps
