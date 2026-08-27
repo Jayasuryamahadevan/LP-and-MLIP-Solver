@@ -563,3 +563,153 @@ exact failure mode documented at the call site — not attempted in this
 pass, and not recommended as the next default action given items 1-3 of
 `docs/research/HIGHS_GAP_ANALYSIS.md`'s own ranked candidate list (§6) do
 not depend on this line of work at all.
+
+### Greedy minimum-degree column ordering — attempted, two real bugs fixed, reverted for the same class of solvability regression as hyper-sparse FTRAN
+
+`IMPLEMENTED` (then reverted), `MEASURED`. `docs/ROADMAP_STATUS.md`
+priority item 5 and `docs/research/HIGHS_GAP_ANALYSIS.md` §2.2/§6/§7 both
+independently ranked a fill-reducing factorization ordering as the
+highest-confidence remaining lever on the HiGHS LP-speed gap. `factorize()`
+(`src/lp/BasisFactorization.cpp`) previously ordered columns once by
+ascending original nonzero count only ("the poor man's version of the
+explicit triangularization phase production codes run first," per its own
+comment) with row pivots tie-broken by a *static* row count — no true
+per-step fill prediction. Implemented `compute_min_degree_order()`: greedy
+minimum-degree (Tinney & Walker 1967; surveyed in George & Liu 1981) on
+the column-intersection graph, using the classical elimination-graph
+clique rule (Markowitz 1957) at each step, computed once per `factorize()`
+call and substituted for the ascending-nnz order.
+
+**Deliberately scoped down from full AMD/COLAMD** (Amestoy, Davis & Duff
+1996), stated explicitly per this project's own convention: AMD's own
+contribution over the classical algorithm is (a) an *approximate* degree
+update that avoids exact recomputation, and (b) a quotient-graph /
+element-absorption representation that keeps each step cheap on large,
+dense graphs. Both are substantial additional machinery with real bug
+surface; implementing the *exact* classical algorithm first, protected by
+a hard computational budget standing in for AMD's own approximation, was
+judged the lower-risk first increment given `docs/ROADMAP_STATUS.md`'s
+preference for measured, incremental changes.
+
+**Two real bugs found and fixed before this got anywhere near a
+benchmark** (exactly the discipline this project has now exercised
+repeatedly — investigate and fix immediately, don't note and continue):
+
+1. **A stale lazy-deletion key produced an invalid permutation.** The
+   first version tried to keep a `std::set<{degree, column}>` priority
+   structure in sync by erasing the exact old `{degree, column}` key
+   whenever a column's adjacency changed, then reinserting the new one.
+   This is wrong whenever a column's adjacency is touched more than once
+   in the same elimination step (which the clique-formation step routinely
+   does): by the time the "erase old key" call runs, the column's degree
+   has already changed from what was actually stored, so the erase
+   silently fails to find a match (`std::set::erase` on a missing key is a
+   no-op, not an error) and leaves an orphaned stale entry. Popping that
+   entry later produced a **duplicate column in the output order**, and
+   since the order must be a permutation of every column, a corresponding
+   column went **missing** — `factorize()` then ran out of columns for
+   some row and reported a spurious singular basis on matrices that are
+   provably nonsingular by construction. Caught immediately by this file's
+   own dense-reference tests
+   (`basis_factorization_matches_dense_on_random_sparse_matrices`,
+   `..._ftran_matches_dense_on_unit_vector_rhs`, both asserting
+   `result.singular.empty()` on a strongly-diagonal, genuinely nonsingular
+   matrix) — 14 of 145 tests failed, none of them subtle. Fixed with the
+   standard lazy-deletion pattern (Cormen et al.): a `current_degree[]`
+   array as the single source of truth, entries validated on pop rather
+   than precisely erased on every mutation.
+
+2. **The fill-edge budget didn't bound the actual cost driver.** The
+   safety cap (`kMinDegreeEdgeBudgetMultiplier`, mirroring
+   `kHyperSparseDensityThreshold`'s own fallback discipline) originally
+   charged only when a candidate pair became a genuinely *new* edge. But
+   the per-step clique-formation loop performs an `O(log n)` set lookup
+   for **every** candidate pair among a node's active neighbors, whether
+   or not that pair turns out to be a new edge — so a step whose neighbor
+   set had already saturated into a near-clique (mostly pre-existing
+   edges, no new-edge charges) paid full `O(degree²)` cost with **no
+   budget protection at all**. MEASURED on `pilot87` (2,030 rows,
+   `profile_simplex`, single process, one clean run each, nothing else
+   running): baseline is 28.819 s wall, with the refactorization stage at
+   11.517 s (40.4% of total) over 136 refactorizations; the
+   charge-on-insert-only version pushed the same stage to 266.075 s across
+   131 refactorizations — 92.9% of a 290.854 s total, a real **~9x
+   wall-clock regression**, root-caused by isolating the ordering as the
+   only changed variable (identical binary, ordering toggled off via a
+   one-line edit, same instance, same machine). Fixed by charging the
+   budget for every candidate pair *examined*, not merely every pair
+   *inserted* — this directly bounds the true `O(degree²)` cost driver.
+   After the fix and a corresponding budget increase (32x → 64x original
+   nonzero count, chosen empirically to restore full fill reduction on
+   the synthetic test below), `pilot87` returned to 36.039 s wall / 18.693
+   s refactorization (136 refactorizations, unchanged iteration count) —
+   still a real ~25% wall-clock cost relative to the 28.819 s baseline on
+   this specific instance, with no offsetting iteration-count reduction
+   visible (see the aggregate-sweep finding below for why this was never
+   resolved further).
+
+**Fill reduction itself worked as designed.** A new test
+(`basis_factorization_min_degree_order_reduces_grid_laplacian_fill`)
+constructs a 12x12 five-point-stencil grid Laplacian (m=144, a textbook
+naive-ordering fill stress case, George & Liu 1981) — MEASURED via a
+standalone harness linking `BasisFactorization.cpp` directly with one
+ordering flag flipped, otherwise identical code: the prior ascending-nnz
+ordering produces 5,444 factor nonzeros; minimum-degree produces 2,741 —
+a real **~49.6% fill reduction**, confirming the ordering mechanism itself
+is correct and effective on a case chosen independently of this project's
+own benchmark instances.
+
+**What actually killed it: the same class of solvability regression as
+hyper-sparse FTRAN, confirmed by the same isolation methodology.** A full
+`validate_netlib` sweep (`presolve hybrid`, single process) with the fixed,
+64x-budget ordering active showed `pilot87` failing — `ITER_LIMIT`, not a
+near-miss, 13,088 iterations against the same instance that solves cleanly
+otherwise (89/90, "FAILED: pilot87"). Root-caused by direct experiment,
+not assumed: the **identical sweep with the ordering forced off** (its
+result computed and then discarded, so `q_` is bit-identical to the old
+ascending-nnz order) **also failed pilot87 the same way** (89/90, same
+instance). A third run at pristine `HEAD` — `compute_min_degree_order()`
+not even called — passed cleanly (90/90), and repeated twice for
+stability (241,995 iterations, bit-identical both times). The conclusion
+this triangulates to: merely **introducing the new ordering computation as
+additional CPU-bound work in the refactorization path is enough to
+perturb this project's existing OpenMP-parallel floating-point summation
+order** on an already-marginal instance and tip it past its iteration
+limit — the exact mechanism documented in the hyper-sparse FTRAN section
+above, triggered here not by a changed pivot sequence but by changed
+thread-scheduling/timing from the extra computation itself, even when
+that computation's output goes unused.
+
+**Disposition: reverted, not shipped behind a flag** — same reasoning as
+hyper-sparse FTRAN: intermittent non-convergence on a real Netlib
+instance under this project's actual default multi-threaded configuration
+is a solvability regression, not a "doesn't help enough" outcome, and no
+default-off flag makes a *reachable* code path carrying this failure mode
+acceptable. `src/lp/BasisFactorization.cpp` was reverted in full (`git
+stash` against the two changed files, verified diff was purely additive
+to this attempt, then dropped) to the pre-change `HEAD`, re-verified
+90/90 stable across two repeated sweeps post-revert. The grid-Laplacian
+fill-reduction test was reverted along with it, since it tests a
+mechanism no longer wired into `factorize()`.
+
+**For a future attempt, recorded as a `RESEARCH HYPOTHESIS`:** this is now
+the *second* independent case (after hyper-sparse FTRAN) where a
+mathematically-correct, exhaustively-unit-tested change to the
+factorization/solve path destabilized `pilot87` specifically via
+parallel-floating-point non-determinism, not via a logic defect. That
+instance's own sensitivity — not either individual technique — is
+increasingly the load-bearing fact. A future attempt at either technique,
+or at any change to `factorize()`'s hot path, should budget for this
+directly: run `pilot87` (and ideally a small stable of similarly
+degenerate/large instances) repeated 3-5x under the real default
+multi-threaded configuration as a *required* gate before considering any
+factorization-path change measured, not as an optional follow-up check.
+A single-threaded (`OMP_NUM_THREADS=1`) isolation run, which resolved the
+FTRAN case cleanly, was not re-attempted here given the additional
+finding that even a *discarded* computation reproduces the failure — the
+next attempt at either line of work should start there rather than
+re-discover it. Separately: this session's own `HIGHS_GAP_ANALYSIS.md`
+ranks MIP-specific presolve and a RENS-class primal heuristic (§6, items
+2-3) above any further factorization-ordering work, and neither depends
+on `factorize()`'s hot path at all — the more promising near-term
+direction given this outcome.

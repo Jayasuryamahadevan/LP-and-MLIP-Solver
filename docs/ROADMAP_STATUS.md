@@ -229,7 +229,7 @@ objective-row RHS.
 | Presolve (core reductions) | `IMPLEMENTED` |
 | **Warm-started dual simplex** (`Simplex::set_warm_start_basis`/`export_basis`) | `IMPLEMENTED`, `MEASURED` — see below |
 | Hyper-sparse **BTRAN** with active-pattern detection | `IMPLEMENTED`, `MEASURED` — see below; FTRAN's `ftran_column` deferred |
-| Markowitz / AMD ordering, symbolic reuse | **NOT IMPLEMENTED** |
+| Markowitz / AMD ordering, symbolic reuse | `ATTEMPTED`, `MEASURED`, **REVERTED** — see item 5 below and `docs/architecture/LP.md` §9 |
 | Presolve expansion (doubleton, aggregation, probing, …) | **NOT IMPLEMENTED** |
 
 `MEASURED` (`docs/architecture/LP.md` §9): `BasisFactorization::btran` now
@@ -507,16 +507,41 @@ benchmark-ready, which is now the top item below.
    changed summation order and this project's pre-existing OpenMP
    floating-point non-associativity, not a logic defect. Full account:
    `docs/architecture/LP.md`'s new "Hyper-sparse FTRAN" subsection under
-   §9. **Now the top item, per `docs/research/HIGHS_GAP_ANALYSIS.md`'s
-   own ranked candidate list (§6), which reaches the same conclusion
-   independently: Markowitz/AMD ordering.**
-5. **Markowitz/AMD fill-reducing ordering for basis factorization** —
-   `docs/research/HIGHS_GAP_ANALYSIS.md` §2.2/§6/§7: the single
-   highest-confidence remaining lever for closing the measured 7.25x
-   HiGHS LP-speed gap (`docs/measurements/highs_comparison.md`), and the
-   most direct literature-supported "standard, expected" piece this
-   project's factorization is still missing. Benchmark on `stocfor3` for
-   direct comparability with the BTRAN measurement.
+   §9. Per `docs/research/HIGHS_GAP_ANALYSIS.md`'s own ranked candidate
+   list (§6), Markowitz/AMD ordering was next — also attempted and also
+   reverted, for the same underlying reason; see item 5 below.
+5. ~~Markowitz/AMD fill-reducing ordering for basis factorization~~ —
+   **attempted, two real bugs found and fixed (a stale lazy-deletion key
+   that silently produced an invalid column permutation; a fill-edge
+   budget that charged only successful insertions and so left the true
+   `O(degree²)` per-step cost unbounded, MEASURED as a ~9x wall-clock
+   regression on `pilot87` before the fix), fill-reduction mechanism
+   itself confirmed working (~49.6% fewer factor nonzeros on a 12x12 grid
+   Laplacian stress case), but REVERTED**: a full `validate_netlib` sweep
+   showed `pilot87` failing (`ITER_LIMIT`, 89/90) with the fixed ordering
+   active — and, root-caused by direct isolation, **even with the
+   ordering's result forced unused**, because merely computing it as
+   additional CPU-bound work in the refactorization path was enough to
+   perturb this project's existing OpenMP-parallel floating-point
+   summation order and tip this same already-marginal instance past its
+   iteration limit. A third run at pristine `HEAD` (ordering not called
+   at all) passed 90/90, repeated twice for bit-identical stability. This
+   is the *second* independent case (after hyper-sparse FTRAN, item 4
+   below) of a mathematically-correct, exhaustively-tested change to the
+   factorization/solve path destabilizing `pilot87` via parallel
+   floating-point non-determinism rather than a logic defect — that
+   instance's own sensitivity, not either individual technique, is
+   increasingly the load-bearing fact. Full account: `docs/architecture/
+   LP.md`'s new "Greedy minimum-degree column ordering" subsection under
+   §9, including the `RESEARCH HYPOTHESIS` for a future attempt (a
+   required multi-repeat `pilot87` stability gate under the real default
+   multi-threaded configuration before any further `factorize()`
+   hot-path change is considered measured, not an optional follow-up).
+   **Now the top item, per this same finding and `docs/research/
+   HIGHS_GAP_ANALYSIS.md`'s own §6 ranking (which placed this second and
+   third): MIP-specific presolve and a RENS-class primal heuristic
+   (folded into item 8 below), neither of which touches `factorize()`'s
+   hot path at all.**
 6. Feasibility polishing for the six stalling PDLP instances.
 7. Layer D refinery generator — without it, no refinery claim is admissible.
 8. Resume MILP cut work (§1 above, PAUSED not abandoned) with the
