@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Must be set before project()/enable_language(CUDA): CMake populates
+# CMAKE_CUDA_ARCHITECTURES with its own compiler-chosen default as part of
+# CUDA language enablement, so a guard placed after project() never fires
+# -- the variable is already non-empty by then. Verified on this machine:
+# CMake 4.2.3 + CUDA 13.3 defaulted to sm_75 (Turing) despite the actual
+# dev GPU being an sm_89 RTX 3050 Laptop (Ada), producing a fatbin the
+# driver rejects at kernel-launch time ("PTX compiled with an unsupported
+# toolchain") instead of a build-time mismatch, so it went undetected by
+# compilation alone. CC 8.9 measured directly via a device-query smoke
+# test -- see docs/architecture/CPU_GPU.md.
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89)
+endif()
+
 project(sihps_solver LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -8,12 +22,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# CC 8.9 measured directly on the target dev GPU (RTX 3050 Laptop) via a
-# device-query smoke test -- see docs/architecture/CPU_GPU.md.
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)
-endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
