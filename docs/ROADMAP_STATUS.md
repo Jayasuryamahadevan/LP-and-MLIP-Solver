@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 132 / 132 | `ctest` (128 pre-existing + 4 GMI-cut hand-verified cases) |
+| unit tests | 133 / 133 | `ctest` (128 pre-existing + 5 GMI-cut hand-verified cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -368,19 +368,23 @@ benchmark-ready, which is now the top item below.
    don't trigger the cover condition either) — root GMI cuts
    (`docs/architecture/MILP.md` §2.2) were built directly against this,
    are correct (hand-verified), but **did not clear the KPI gate**: 3/5
-   instances get worse, one regresses from certified to timeout, and one
-   hits `NUMERICAL_FAILURE` from unfiltered floating-point-noise and
-   large-magnitude cut coefficients. Concrete next candidate, now the top
-   MILP item: **numerical cleanup for GMI cuts** — a relative near-zero
-   coefficient threshold (not just exact-zero) and a coefficient dynamic-
-   range/magnitude rejection filter, both standard, established
-   engineering techniques in the cutting-plane literature (Cornuéjols
-   2008 on numerical practicalities) — then re-run the exact same
-   `bench_miplib` A/B before considering the default flipped. Separating
-   cuts at more than one round/node (currently root-only for both
-   families) remains a separate, later candidate.
+   instances got worse, one regressed from certified to timeout, and one
+   hit `NUMERICAL_FAILURE`. Root-caused precisely (not guessed) and
+   fixed with three MEASURED-motivated numerical filters
+   (`docs/architecture/MILP.md` §2.2.1: a fractionality floor bounding
+   1/f_r amplification, a relative near-zero cleanup, and a dynamic-
+   range/magnitude cap) — `NUMERICAL_FAILURE` is gone, but **the KPI
+   gate is still not cleared** on re-measurement: aggregate incumbent
+   quality is no better than before the fix, and worse on `pk1`
+   specifically. `enable_root_gmi_cuts` stays off by default. This line
+   of work is PAUSED, not abandoned: the next hypothesis (cut density,
+   not numerical safety, per §2.2.1's closing paragraph) is recorded but
+   unattempted. Per this document's own priority order, the next
+   iteration moves to item 2 below rather than a third pass at MILP
+   cuts against a set that includes a deliberately adversarial instance
+   (`markshare2`) no cut approach reaches.
 2. **Peak RSS / VRAM capture and repeated-run medians** — the two Phase 0 gaps
-   that still let a regression hide.
+   that still let a regression hide. **Now the top item** — see above.
 3. **Generated adversarial LPs + Compute Sanitizer** — Phase 1's real
    acceptance criteria, currently only argued from Netlib.
 4. **Hyper-sparse FTRAN** (BTRAN is now done — `docs/architecture/LP.md`

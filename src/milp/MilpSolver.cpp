@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -401,13 +402,68 @@ void append_general_cuts(LpProblem& workspace, const std::vector<GeneralCut>& cu
 // (structural AND slack); nonbasic slack terms are substituted back via
 // s_i = rhs_i - (Ax)_i to produce a cut purely in ORIGINAL structural
 // variables, the space append_general_cuts appends new rows into.
+//
+// Numerical safety (ENGINEERING DECISION; both mechanisms below were
+// directly MEASURED, not assumed -- see docs/architecture/MILP.md \S2.2
+// for the full account and the diagnostic runs that produced these
+// numbers, on gen-ip054 from bench_miplib's 5-instance MIPLIB set):
+//
+// 1. kGmiMinFractionality. Every branch-coefficient formula below divides
+// by f_r or (1-f_r); a basic variable that is only barely fractional
+// amplifies bar_rho by up to 1/f_r before it becomes a cut term -- the
+// classic, well-documented numerical weakness of Gomory-derived cuts
+// (Cornuejols, "Valid inequalities for mixed integer linear programs",
+// 4OR 6, 2008, notes coefficient-magnitude disparity from exactly this
+// mechanism as a standard practical hazard). MEASURED: a row with
+// f_r = 1.00491e-07 (barely above integrality_tolerance's own 1e-7
+// eligibility floor) produced a cut coefficient of 3.7e7 from a
+// bar_rho of order 1 -- the 1/f_r amplification accounts for essentially
+// all of it. 0.01 bounds that amplification to 100x, comfortably below
+// where it becomes the dominant term.
+//
+// 2. kGmiRelativeZeroTolerance. A coefficient smaller than this fraction
+// of the cut's own largest surviving coefficient is treated as the
+// floating-point-roundoff residue it almost certainly is (an exact
+// algebraic zero, from cancellation in the slack-substitution
+// arithmetic, has no reason to land near double's ~2.2e-16 machine
+// epsilon by chance) rather than a real term. MEASURED: a coefficient of
+// 4.49e-16 was observed sitting next to O(1) terms in an otherwise
+// unrelated cut.
+//
+// 3. kGmiMaxDynamicRange / kGmiMaxRelativeMagnitude. A final,
+// independent safety net over the assembled cut, applied after (1) and
+// (2): slack substitution sums a term across every nonzero in a row, so
+// even a bounded per-term coefficient can compound into a cut whose
+// scale is far beyond the original model's own. Both checks REJECT
+// rather than rescale -- dynamic range is scale-invariant (uniform
+// rescaling cannot change the ratio between a cut's own largest and
+// smallest coefficients), and discarding a numerically dangerous cut is
+// always safe, exactly the standard mitigation in the cutting-plane
+// literature (Cornuejols 2008; cut-quality-based selection in
+// Achterberg, "Constraint Integer Programming", PhD thesis, TU Berlin,
+// 2007, rejects rather than repairs). kGmiMaxRelativeMagnitude compares
+// against THIS root relaxation's own largest matrix coefficient (not an
+// arbitrary constant), matching the same MPS instance's own units.
+constexpr double kGmiMinFractionality = 0.01;
+constexpr double kGmiRelativeZeroTolerance = 1e-9;
+constexpr double kGmiMaxDynamicRange = 1e8;
+constexpr double kGmiMaxRelativeMagnitude = 1e4;
+
 std::vector<GeneralCut> separate_gmi_cuts(const MilpProblem& problem, const LpProblem& workspace,
                                            const Simplex& simplex, const std::vector<double>& x,
-                                           double integrality_tolerance,
                                            double violation_tolerance, std::uint32_t limit) {
     std::vector<GeneralCut> cuts;
     const std::int32_t n_struct = workspace.n_cols();
     const std::int32_t n_slack = workspace.n_rows();
+
+    double matrix_max_abs = 0.0;
+    {
+        const double* values = workspace.A.values();
+        for (std::int32_t k = 0; k < workspace.A.nnz(); ++k) {
+            matrix_max_abs = std::max(matrix_max_abs, std::fabs(values[k]));
+        }
+    }
+    if (matrix_max_abs <= 0.0) return cuts; // no structural coefficients at all
 
     std::vector<double> struct_coeff(static_cast<std::size_t>(n_struct));
 
@@ -421,7 +477,7 @@ std::vector<GeneralCut> separate_gmi_cuts(const MilpProblem& problem, const LpPr
         if (!std::isfinite(beta)) continue;
         const double floor_beta = std::floor(beta);
         const double f_r = beta - floor_beta;
-        if (f_r <= integrality_tolerance || 1.0 - f_r <= integrality_tolerance) continue;
+        if (f_r < kGmiMinFractionality || 1.0 - f_r < kGmiMinFractionality) continue;
 
         const std::vector<double> rho = simplex.tableau_row(row);
         std::fill(struct_coeff.begin(), struct_coeff.end(), 0.0);
@@ -506,6 +562,36 @@ std::vector<GeneralCut> separate_gmi_cuts(const MilpProblem& problem, const LpPr
             }
         }
         if (reject_row) continue;
+
+        // Numerical cleanup 1: drop coefficients that are almost certainly
+        // floating-point-roundoff residue rather than real terms (see the
+        // function-level comment, kGmiRelativeZeroTolerance).
+        double row_max_abs = 0.0;
+        for (std::int32_t k = 0; k < n_struct; ++k) {
+            row_max_abs = std::max(row_max_abs, std::fabs(struct_coeff[static_cast<std::size_t>(k)]));
+        }
+        if (row_max_abs <= 0.0) continue; // every term cancelled exactly; no cut
+        const double zero_floor = kGmiRelativeZeroTolerance * row_max_abs;
+        double cut_min_abs = std::numeric_limits<double>::infinity();
+        double cut_max_abs = 0.0;
+        for (std::int32_t k = 0; k < n_struct; ++k) {
+            const auto kk = static_cast<std::size_t>(k);
+            const double c = struct_coeff[kk];
+            if (c == 0.0) continue;
+            if (std::fabs(c) < zero_floor) {
+                struct_coeff[kk] = 0.0;
+                continue;
+            }
+            cut_min_abs = std::min(cut_min_abs, std::fabs(c));
+            cut_max_abs = std::max(cut_max_abs, std::fabs(c));
+        }
+        // Numerical cleanup 2/3: reject (never rescale -- see the
+        // function-level comment) a cut whose surviving coefficients still
+        // span too wide a range, or are too large relative to this
+        // relaxation's own matrix, to trust numerically.
+        if (cut_max_abs <= 0.0) continue;
+        if (cut_max_abs / cut_min_abs > kGmiMaxDynamicRange) continue;
+        if (cut_max_abs > kGmiMaxRelativeMagnitude * matrix_max_abs) continue;
 
         const double cut_rhs = 1.0 - constant;
         double lhs = 0.0;
@@ -990,7 +1076,6 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
                 gmi_lp.x.size() == static_cast<std::size_t>(problem.n_cols())) {
                 const auto cuts =
                     separate_gmi_cuts(problem, workspace, gmi_simplex, gmi_lp.x,
-                                      options.integrality_tolerance,
                                       options.cut_violation_tolerance, options.max_root_gmi_cuts);
                 if (!cuts.empty()) {
                     append_general_cuts(workspace, cuts);

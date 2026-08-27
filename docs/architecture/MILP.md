@@ -220,6 +220,79 @@ struct GeneralCut {
 };
 ```
 
+#### 2.2.1 Numerical cleanup: fixes the crash, does not clear the KPI gate
+
+`IMPLEMENTED`, `MEASURED`, follow-up to the above. Root-caused both
+failure mechanisms precisely (temporary diagnostic instrumentation, not
+guesswork) before writing any fix:
+
+- The `4.5e-16`-magnitude coefficient (§2.2 above) is floating-point-
+  roundoff residue from slack-substitution cancellation, confirmed by
+  reproducing it directly.
+- The `gen-ip054` `NUMERICAL_FAILURE` row specifically: `f_r =
+  1.00491e-07`, barely above `integrality_tolerance`'s own `1e-7`
+  eligibility floor. Every branch-coefficient formula (§2.2) divides by
+  `f_r` or `(1-f_r)`, so this amplifies a `bar_rho` of order 1 into the
+  observed `3.7e7`-magnitude coefficient almost exactly (`3.7 / 1.005e-7
+  ≈ 3.68e7`) — the well-documented 1/f_r instability of Gomory-derived
+  cuts (Cornuéjols 2008).
+
+Three independent, MEASURED-motivated filters added to
+`separate_gmi_cuts`, all reject rather than rescale (dynamic range is
+scale-invariant — uniform rescaling cannot fix a bad ratio between a
+cut's own coefficients — and discarding a numerically dangerous cut is
+always safe, the standard mitigation in Cornuéjols 2008 and in
+Achterberg's cut-selection chapter, *Constraint Integer Programming*,
+PhD thesis, TU Berlin, 2007):
+
+| filter | threshold | targets |
+|---|---|---|
+| `kGmiMinFractionality` | row eligible only if `f_r` and `1-f_r` both `>= 0.01` | 1/f_r amplification — bounds it to 100x |
+| `kGmiRelativeZeroTolerance` | coefficient dropped if `< 1e-9 ×` the cut's own largest surviving coefficient | floating-point-roundoff residue |
+| `kGmiMaxDynamicRange` / `kGmiMaxRelativeMagnitude` | reject cut if `max/min coefficient ratio > 1e8`, or `max coefficient > 1e4 ×` this relaxation's own largest matrix coefficient | compounded magnitude from dense slack substitution, as a final safety net independent of the first two |
+
+Correctness: the four existing hand-derived GMI unit tests are
+unaffected (their coefficients are `O(1)`, well inside every threshold);
+a fifth, `gmi_cut_rejects_row_with_near_integer_basic_fraction`, hand-
+constructs a row with `f_r = 0.005` (below the floor) and asserts
+`root_gmi_cuts == 0` while the solver still reaches the correct answer
+through ordinary branching. 133/133 unit tests pass.
+
+**`MEASURED`, same `bench_miplib` A/B, same 5 instances, 60s budget,
+single process — re-run after this fix:**
+
+| instance | baseline (GMI off) | GMI on, before this fix | GMI on, after this fix |
+|---|---|---|---|
+| `gen-ip002` | TIME_LIMIT, gap 0.00417 | TIME_LIMIT, gap 0.00451 | TIME_LIMIT, gap 0.00451 (unchanged) |
+| `gen-ip054` | TIME_LIMIT, obj 6857.87 | **NUMERICAL_FAILURE**, obj 6961.18 | TIME_LIMIT, obj 6865.68 (crash fixed; still worse than baseline) |
+| `markshare2` | TIME_LIMIT, obj 231 | TIME_LIMIT, obj 570 | TIME_LIMIT, obj 570 (unchanged) |
+| `neos859080` | **INFEASIBLE, certified, 0.87s** | TIME_LIMIT, obj 0 | TIME_LIMIT, obj 0 (still regressed) |
+| `pk1` | TIME_LIMIT, obj 44 | TIME_LIMIT, obj 44 | TIME_LIMIT, obj 60 (further regressed) |
+| certified | 1/5 | 0/5 | 0/5 |
+
+**Verdict, stated exactly as measured: the crash is a real, fixed defect
+— worth keeping — but the KPI gate is still not cleared.** Aggregate
+incumbent quality after the fix is no better than before it, and on
+`pk1` it is measurably worse despite the identical cut *count* (15
+before and after) — the surviving cuts' coefficients changed slightly
+under cleanup, which was enough to send branch-and-bound down a
+different tree (a known sensitivity of B&B to small perturbations, not
+a new numerical defect: every accepted incumbent still passes the
+independent original-space feasibility gate, §4.1). `enable_root_gmi_cuts`
+stays `false` by default.
+
+`KNOWN LIMITATION`, next hypothesis, not yet implemented or measured:
+the remaining gap looks less like a numerical-safety problem now (that
+mechanism is fixed) and more like density/cost — GMI cuts from a dense
+tableau row are typically dense themselves (nonzero on most structural
+columns after slack substitution touches every column in the
+substituted row), so every subsequent node's LP relaxation carries that
+extra cost for the life of the tree, for a bound improvement that these
+5 instances don't appear to repay. A per-cut density cap (reject cuts
+above some nonzero-fraction threshold) is the next concrete candidate if
+this line of work is picked up again; it was not attempted in this pass
+so nothing is claimed about it.
+
 ## 3. Symmetry
 
 Per prompt.md §2.9's explicit instruction — **do not implement orbital branching simply because it was requested; evaluate whether it is appropriate for each identified refinery scheduling structure** — the evaluation, drawing on SOTA.md §1.4.3:

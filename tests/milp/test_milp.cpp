@@ -63,6 +63,25 @@ MilpProblem single_row_l_type_integer() {
     return MilpProblem{std::move(lp), {VariableType::INTEGER}};
 }
 
+// 2*x1 <= 6.01: LP optimum x1 = 3.005, f_r = 0.005 -- deliberately below
+// kGmiMinFractionality (0.01, src/milp/MilpSolver.cpp's separate_gmi_cuts),
+// the numerical-safety floor added after gen-ip054 (bench_miplib's
+// 5-instance MIPLIB set) MEASURABLY produced a 3.7e7-magnitude cut
+// coefficient from a row with f_r = 1.00491e-07 -- confirmed by direct
+// diagnostic instrumentation to be the 1/f_r amplification, not a
+// coding bug (docs/architecture/MILP.md \S2.2).
+MilpProblem single_row_l_type_integer_near_integer_fraction() {
+    LpProblem lp;
+    lp.A = CSRMatrix::from_triplets(1, 1, {Triplet{0, 0, 2.0}});
+    lp.obj = {-1.0};
+    lp.rhs = {6.01};
+    lp.row_types = {'L'};
+    lp.lower = {0.0};
+    lp.upper = {100.0};
+    sihps::apply_default_row_bounds(lp);
+    return MilpProblem{std::move(lp), {VariableType::INTEGER}};
+}
+
 MilpProblem impossible_integer_equality() {
     LpProblem lp;
     lp.A = CSRMatrix::from_triplets(1, 1, {Triplet{0, 0, 2.0}});
@@ -246,6 +265,26 @@ SIHPS_TEST(gmi_cut_from_g_row_is_required_for_one_node_certification) {
     const auto result = sihps::solve_milp(integer_cover(), options);
 
     SIHPS_ASSERT_TRUE(result.status == MilpStatus::NODE_LIMIT);
+}
+
+// Precise, deterministic test of the numerical-safety fractionality
+// floor: a row whose basic integer variable is only barely fractional
+// (f_r = 0.005, below kGmiMinFractionality's 0.01) must NOT produce a
+// GMI cut -- MEASURED to be exactly the mechanism that made gen-ip054
+// numerically fail before this filter existed. The solver must still
+// reach the correct answer via ordinary branching once the (rejected)
+// row is left uncut.
+SIHPS_TEST(gmi_cut_rejects_row_with_near_integer_basic_fraction) {
+    MilpSolverOptions options;
+    options.use_rounding_heuristic = false;
+    options.enable_root_cover_cuts = false;
+    options.enable_root_gmi_cuts = true;
+    const auto result =
+        sihps::solve_milp(single_row_l_type_integer_near_integer_fraction(), options);
+
+    SIHPS_ASSERT_TRUE(result.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_TRUE(result.root_gmi_cuts == 0);
+    SIHPS_ASSERT_NEAR(result.objective_value, -3.0, 1e-8);
 }
 
 SIHPS_TEST(milp_maps_unbounded_pure_continuous_relaxation_to_unbounded) {
