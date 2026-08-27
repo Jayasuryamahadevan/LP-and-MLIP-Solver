@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 145 / 145 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot + 6 adversarial-LP + 3 sparse-RHS FTRAN cases, the adversarial-LP set covering 400 generated instances) |
+| unit tests | 152 / 152 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding cases: 5 presolve-level hand-derived, 1 MILP-level "certifies without branching", 1 infeasibility-without-branching) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -230,7 +230,8 @@ objective-row RHS.
 | **Warm-started dual simplex** (`Simplex::set_warm_start_basis`/`export_basis`) | `IMPLEMENTED`, `MEASURED` — see below |
 | Hyper-sparse **BTRAN** with active-pattern detection | `IMPLEMENTED`, `MEASURED` — see below; FTRAN's `ftran_column` deferred |
 | Markowitz / AMD ordering, symbolic reuse | `ATTEMPTED`, `MEASURED`, **REVERTED** — see item 5 below and `docs/architecture/LP.md` §9 |
-| Presolve expansion (doubleton, aggregation, probing, …) | **NOT IMPLEMENTED** |
+| Presolve expansion (doubleton, aggregation, probing, …) | **NOT IMPLEMENTED** — LP-level; distinct from the MIP-specific row below |
+| MIP-specific presolve: integer bound rounding (`src/lp/Presolve.cpp`'s opt-in `integer_columns`, `MilpSolverOptions::enable_integer_bound_rounding`) | `IMPLEMENTED`, `MEASURED`, default on — see item 8 below and `docs/architecture/MILP.md` §1.4a |
 
 `MEASURED` (`docs/architecture/LP.md` §9): `BasisFactorization::btran` now
 uses Gilbert-Peierls DFS reachability instead of an unconditional O(m)
@@ -537,23 +538,41 @@ benchmark-ready, which is now the top item below.
    required multi-repeat `pilot87` stability gate under the real default
    multi-threaded configuration before any further `factorize()`
    hot-path change is considered measured, not an optional follow-up).
-   **Now the top item, per this same finding and `docs/research/
-   HIGHS_GAP_ANALYSIS.md`'s own §6 ranking (which placed this second and
-   third): MIP-specific presolve and a RENS-class primal heuristic
-   (folded into item 8 below), neither of which touches `factorize()`'s
-   hot path at all.**
+   Per this same finding and `docs/research/HIGHS_GAP_ANALYSIS.md`'s own
+   §6 ranking (which placed this second and third): MIP-specific presolve
+   and a RENS-class primal heuristic, neither of which touches
+   `factorize()`'s hot path at all. MIP-specific presolve's first
+   increment is now done — see item 8 below.
 6. Feasibility polishing for the six stalling PDLP instances.
 7. Layer D refinery generator — without it, no refinery claim is admissible.
-8. Resume MILP cut work (§1 above, PAUSED not abandoned) with the
-   density-based hypothesis, once items 2-3 have made further correctness
-   infrastructure progress. `docs/research/HIGHS_GAP_ANALYSIS.md` §5-6
-   independently identifies two further, previously-unnamed MILP levers
-   worth folding into this line of work when it resumes: MIP-specific
-   presolve (probing, clique merging, dual fixing on integers — currently
-   completely absent, confirmed by reading `docs/architecture/MILP.md`
-   directly) and a RENS-class primal heuristic (this project has only
-   safe-rounding + LP diving; HiGHS ships RENS/RINS/feasibility-jump by
-   default).
+8. ~~Resume MILP cut work with MIP-specific presolve~~ — **integer bound
+   rounding: done, MEASURED, shipped default ON.** Rounds any bound
+   presolve derives for an integer-restricted column inward to the nearest
+   integer (`src/lp/Presolve.{hpp,cpp}`'s new `integer_columns` parameter;
+   `MilpSolverOptions::enable_integer_bound_rounding`). Soundness is
+   unconditional (never excludes an integer-feasible point) and needs no
+   new postsolve machinery, unlike doubleton/aggregation below.
+   `bench_miplib` on the 5-instance set, flag off vs. on: every instance's
+   node count moved down or stayed flat, none regressed; `neos859080` (the
+   one instance that terminates on its own rather than the time limit) went
+   331 → 95 nodes (-71%), reproduced bit-identically on a repeat run. One
+   fixture shape (`2x=1`, x integer) is now proved infeasible from presolve
+   alone, zero B&B nodes. `validate_netlib` 90/90, iteration count
+   unchanged from the pre-change baseline — zero effect on plain LP
+   callers. Full account: `docs/architecture/MILP.md` §1.4a. **Deliberately
+   scoped down** (stated explicitly, matching this session's practice):
+   coefficient tightening / GCD-based reductions — the natural next
+   increment, particularly for `markshare2`'s integer-valued matrix
+   coefficients — and clique merging/dual fixing are not attempted here.
+   **Now the top item**: coefficient tightening / GCD-based reductions, or
+   a RENS-class primal heuristic (`docs/research/HIGHS_GAP_ANALYSIS.md`
+   §7 item 3) — both unattempted, neither touches `factorize()`.
+9. Presolve expansion (doubleton, aggregation) for plain LP (Phase 2 table
+   above) — confirmed genuinely unimplemented, benefits both LP and every
+   MILP node relaxation, doesn't touch `factorize()`'s hot path directly
+   though `pilot87`'s now-proven sensitivity to *any* solve-path
+   perturbation argues for a precautionary `validate_netlib` sweep
+   regardless.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

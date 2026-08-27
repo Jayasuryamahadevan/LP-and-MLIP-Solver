@@ -734,6 +734,19 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
     for (VariableType type : problem.variable_types) {
         has_integer_variables |= type != VariableType::CONTINUOUS;
     }
+    // Computed once and reused for every solve_lp() call this search makes
+    // (node relaxations, diving, local improvement, strong-branching
+    // probes) -- see MilpSolverOptions::enable_integer_bound_rounding.
+    // Direct Simplex construction elsewhere in this file (the GMI cut path)
+    // bypasses solve_lp/presolve entirely already, so this mask has no
+    // effect there, by design.
+    if (options.enable_integer_bound_rounding) {
+        relaxation_options.integer_columns.assign(static_cast<std::size_t>(problem.n_cols()), 0);
+        for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
+            relaxation_options.integer_columns[static_cast<std::size_t>(j)] =
+                problem.variable_types[static_cast<std::size_t>(j)] != VariableType::CONTINUOUS ? 1 : 0;
+        }
+    }
 
     std::vector<double> down_pseudocost(static_cast<std::size_t>(problem.n_cols()), 0.0);
     std::vector<double> up_pseudocost(static_cast<std::size_t>(problem.n_cols()), 0.0);

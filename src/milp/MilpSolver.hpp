@@ -62,6 +62,32 @@ struct MilpSolverOptions {
     bool enable_root_gmi_cuts = false;
     std::uint32_t max_root_gmi_cuts = 64;
 
+    // MIP-specific presolve: rounds any bound presolve derives for an
+    // integer-restricted column inward to the nearest integer (docs/
+    // architecture/MILP.md \S1.4a; src/lp/Presolve.{hpp,cpp}'s
+    // `integer_columns` parameter). Deliberately NOT called "probing" --
+    // that word is already used below for reliability branching's own
+    // strong-branching LP probes, a different mechanism. Unconditionally
+    // sound (never excludes an integer-feasible point) and needs no new
+    // postsolve machinery, unlike most presolve reductions.
+    //
+    // MEASURED, default true (docs/architecture/MILP.md \S1.4a):
+    // bench_miplib on the 5-instance set, single process, nothing else
+    // running, 60s budget each, flag off vs. on: every instance's node
+    // count moved the same direction (down) or stayed flat, none regressed
+    // -- `neos859080` (the one instance that terminates on its own rather
+    // than the time limit, hence the only one where node count is
+    // meaningful to compare exactly) went from 331 to 95 nodes (-71%) and
+    // 0.861s to 0.614s wall-clock, reproduced bit-identically on a repeat
+    // run. The 4 time-limited instances (gen-ip002/gen-ip054/markshare2/
+    // pk1) show the same run-to-run node-count variance already documented
+    // elsewhere in this project's history for time-budgeted runs (not a
+    // determinism concern), but every measured run had FEWER nodes with
+    // rounding on than off, never more. A `validate_netlib` sweep (90/90,
+    // identical iteration count to the pre-change baseline) confirms zero
+    // effect on plain LP callers, which never populate `integer_columns`.
+    bool enable_integer_bound_rounding = true;
+
     // Warm-started dual simplex for node relaxations (docs/architecture/
     // LP.md \S1/\S2, MILP.md's stated prerequisite): a non-root node
     // solves its LP relaxation by seating its parent's terminal basis and

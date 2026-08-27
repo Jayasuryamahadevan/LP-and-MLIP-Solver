@@ -135,6 +135,39 @@ SIHPS_TEST(milp_handles_general_integer_variables) {
     SIHPS_ASSERT_NEAR(result.x[0], 2.0, 0.0);
 }
 
+// The concrete "did MIP-specific presolve actually help" fixture: reuses
+// single_row_l_type_integer() (2*x <= 7, x integer in [0,100], minimize
+// -x). Its plain LP root optimum is x=3.5, fractional -- B&B must branch
+// (x<=3 vs x>=4; the latter contradicts the row and prunes immediately,
+// but at least one branch is still required). With integer bound rounding
+// on, presolve rounds the row's own derived upper bound down to
+// floor(3.5) = 3 BEFORE the root relaxation is even solved, so the root LP
+// optimum is already x=3 -- integer-feasible, certifying at the root with
+// zero branching. Same true optimum either way; strictly fewer nodes with
+// rounding on.
+SIHPS_TEST(milp_integer_bound_rounding_certifies_a_single_row_root_without_branching) {
+    MilpProblem problem = single_row_l_type_integer();
+
+    MilpSolverOptions off;
+    off.use_rounding_heuristic = false;
+    off.use_diving_heuristic = false;
+    off.use_local_improvement = false;
+    off.enable_root_cover_cuts = false;
+    off.enable_root_gmi_cuts = false;
+    off.enable_integer_bound_rounding = false;
+    const auto without = sihps::solve_milp(problem, off);
+
+    MilpSolverOptions on = off;
+    on.enable_integer_bound_rounding = true;
+    const auto with = sihps::solve_milp(problem, on);
+
+    SIHPS_ASSERT_TRUE(without.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_TRUE(with.status == MilpStatus::OPTIMAL);
+    SIHPS_ASSERT_NEAR(without.objective_value, -3.0, 1e-8);
+    SIHPS_ASSERT_NEAR(with.objective_value, -3.0, 1e-8);
+    SIHPS_ASSERT_TRUE(with.nodes_processed < without.nodes_processed);
+}
+
 SIHPS_TEST(milp_reports_maximization_objective_in_original_sense) {
     auto problem = binary_knapsack();
     problem.maximize = true;
@@ -146,12 +179,32 @@ SIHPS_TEST(milp_reports_maximization_objective_in_original_sense) {
     SIHPS_ASSERT_NEAR(result.best_bound, 10.0, 1e-8);
 }
 
+// With integer bound rounding OFF, this must be proved the general way --
+// by branch and bound actually exhausting the tree -- so this path stays
+// covered independently of the presolve-level shortcut below.
 SIHPS_TEST(milp_proves_integer_infeasibility_by_exhausting_nodes) {
-    const auto result = sihps::solve_milp(impossible_integer_equality());
+    MilpSolverOptions options;
+    options.enable_integer_bound_rounding = false;
+    const auto result = sihps::solve_milp(impossible_integer_equality(), options);
 
     SIHPS_ASSERT_TRUE(result.status == MilpStatus::INFEASIBLE);
     SIHPS_ASSERT_TRUE(!result.has_incumbent);
     SIHPS_ASSERT_TRUE(result.nodes_processed >= 3);
+}
+
+// 2*x = 1 with x integer has no integer solution at all: presolve's
+// integer bound rounding (default ON) proves this directly from the
+// singleton row alone -- tighten_upper rounds x's upper to floor(0.5) = 0
+// and tighten_lower rounds its lower to ceil(0.5) = 1, crossing (0 < 1),
+// which the very next pass's column_infeasible() check catches -- with
+// ZERO B&B nodes required, a strictly stronger and more efficient result
+// than exhausting the tree.
+SIHPS_TEST(milp_integer_bound_rounding_proves_infeasibility_without_branching) {
+    const auto result = sihps::solve_milp(impossible_integer_equality());
+
+    SIHPS_ASSERT_TRUE(result.status == MilpStatus::INFEASIBLE);
+    SIHPS_ASSERT_TRUE(!result.has_incumbent);
+    SIHPS_ASSERT_TRUE(result.nodes_processed <= 1);
 }
 
 SIHPS_TEST(milp_node_limit_is_not_reported_as_optimal) {
@@ -230,6 +283,11 @@ SIHPS_TEST(gmi_cut_from_l_row_is_required_for_one_node_certification) {
     options.use_rounding_heuristic = false;
     options.enable_root_cover_cuts = false;
     options.enable_root_gmi_cuts = false;
+    // This fixture is ALSO the one integer bound rounding certifies at the
+    // root on its own (milp_integer_bound_rounding_certifies_a_single_row_
+    // root_without_branching, above) -- disabled here so this test isolates
+    // GMI cuts specifically, not that other, independent mechanism.
+    options.enable_integer_bound_rounding = false;
     options.node_limit = 2;
     const auto result = sihps::solve_milp(single_row_l_type_integer(), options);
 
@@ -261,6 +319,10 @@ SIHPS_TEST(gmi_cut_from_g_row_is_required_for_one_node_certification) {
     options.use_rounding_heuristic = false;
     options.enable_root_cover_cuts = false;
     options.enable_root_gmi_cuts = false;
+    // See gmi_cut_from_l_row_is_required_for_one_node_certification's own
+    // comment: isolates GMI cuts from integer bound rounding, which this
+    // fixture's own row (2*x >= 3) is also tight enough for on its own.
+    options.enable_integer_bound_rounding = false;
     options.node_limit = 2;
     const auto result = sihps::solve_milp(integer_cover(), options);
 

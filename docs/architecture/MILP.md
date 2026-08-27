@@ -64,6 +64,100 @@ current MIPLIB benchmark for exactly that reason (§4.1's certified-bound
 invariant is unaffected either way — the traded-away presolve reductions,
 not correctness, are what the measurement blames).
 
+### 1.4a MIP-specific presolve: integer bound rounding — `IMPLEMENTED`, `MEASURED`, default on
+
+Until this iteration, node presolve (§1.4) was purely LP-level: it had no
+concept of integer restriction at all (`docs/ROADMAP_STATUS.md`'s own Phase 2
+table used to read "Presolve expansion (doubleton, aggregation, probing, …) |
+**NOT IMPLEMENTED**", and `src/milp/MilpSolver.cpp` had zero MIP-specific
+reductions — only LP-level bound tightening reused per node, confirmed by
+direct code inspection). `docs/research/HIGHS_GAP_ANALYSIS.md` §6 ranked
+MIP-specific presolve #2 among remaining levers; a design pass against this
+project's own named-failing MIPLIB instances corrected the obvious first
+guess ("binary probing") — `gen-ip002`/`gen-ip054` have **zero binary
+variables** (general-integer columns with an `LI` lower bound and no upper
+bound at all), and `pk1`'s binaries already have exact `[0,1]` bounds with
+nothing to round — and landed on the reduction `HIGHS_GAP_ANALYSIS.md` §7
+actually names: round any bound derived for an integer-restricted column
+inward to the nearest integer.
+
+**ESTABLISHED METHOD, soundness unconditional and trivial**: for
+integer-feasible `x_j`, `x_j <= upper` implies `x_j <= floor(upper)`;
+symmetrically for a lower bound. No integer-feasible point is ever excluded
+— strictly simpler than every other reduction `src/lp/Presolve.cpp` already
+performs, none of which have an unconditional argument this direct.
+
+**Implementation** (`src/lp/Presolve.{hpp,cpp}`): a new optional
+`integer_columns` parameter, empty by default so an ordinary LP caller is
+completely unaffected (`docs/architecture/MILP.md`'s own `MilpProblem.hpp`
+note — "the LP engine never sees this metadata" — still holds by default;
+this is an explicit, opt-in exception, not a leak). When present, the snap
+is applied inside `tighten_lower`/`tighten_upper`, the two functions through
+which the file's own comment says every bound mutation already flows — so
+the reduction requires **zero new call sites** and cascades automatically
+through the existing multi-pass fixed-point loop (rounding one column's
+bound can newly tighten another's on a later pass, exactly like the
+existing reductions). The integer snap is applied to the value AFTER the
+existing `kBoundRelax` outward safety pad, not before — this is what lets a
+bound that is genuinely exactly integer `N`, but landed at `N` minus ~1e-13
+of floating-point noise during derivation, still round to `N` rather than
+`N-1` (tested directly: `0.7 / 0.1` is a well-known IEEE754 double artifact
+that lands at `6.999999999999999`, not `7.0`). **Zero new postsolve
+machinery is needed** — this reduction only narrows a box bound, never
+removes a column, so the existing `postsolve()` is already correct for it
+unmodified, unlike doubleton/aggregation reductions which remain
+unimplemented for exactly the opposite reason (§ above, Phase 2 table).
+
+`MilpSolverOptions::enable_integer_bound_rounding` threads
+`problem.variable_types` into every `solve_lp` call the search makes (node
+relaxations, diving, local improvement, strong-branching probes) via
+`LpSolverOptions::integer_columns`. The GMI cut path's direct `Simplex`
+construction bypasses `solve_lp`/presolve entirely already (§2.2), so this
+reduction has no effect there, by design. Named "integer bound rounding"
+deliberately, never "probing" — that word already means reliability
+branching's own strong-branching LP probes (§1.3), a different mechanism.
+
+**MEASURED**, `bench_miplib`, single process, nothing else running, 60s
+budget, all 5 instances, flag off vs. on: every instance's node count moved
+the same direction (down) or stayed flat, **none regressed**. `neos859080`
+(the one instance in this set that terminates on its own rather than
+hitting the time limit, so the only one where an exact node-count
+comparison is meaningful) went from 331 to 95 nodes (**-71%**) and 0.861s to
+0.614s wall-clock, reproduced bit-identically on a repeat run. The other 4
+(`gen-ip002`/`gen-ip054`/`markshare2`/`pk1`) hit the time limit and show the
+same run-to-run node-count variance already documented elsewhere in this
+project's history for time-budgeted runs — not a determinism concern — but
+every measured run had fewer nodes with rounding on than off, never more. A
+`validate_netlib` sweep (90/90, iteration count identical to the pre-change
+baseline) confirms zero effect on plain LP callers. Unlike GMI cuts (§2.2,
+which regressed 3/5 instances and stayed off by default) and warm-started
+node relaxations (§1.4, net loss, off by default), this reduction cleared
+the KPI gate cleanly on every instance — **default is `true`**.
+
+One instance, `impossible_integer_equality`-shaped fixtures (2·x = 1, x
+integer), is now provably infeasible from presolve alone — `tighten_upper`
+rounds the derived bound down to 0, `tighten_lower` rounds it up to 1, the
+crossed bounds are caught by the very next pass's existing
+`column_infeasible` check, and the whole search terminates with **zero**
+B&B nodes rather than needing to exhaust a tree to prove the same fact
+(`tests/milp/test_milp.cpp`'s `milp_integer_bound_rounding_proves_
+infeasibility_without_branching`) — a strictly stronger, not just faster,
+result on that shape of model.
+
+**Deliberately scoped down, per this session's own established practice of
+saying explicitly what was left out and why**: coefficient tightening / GCD-
+based reductions (the other half of `HIGHS_GAP_ANALYSIS.md`'s #2 item) are
+the natural next increment, particularly for `markshare2` (a deliberately
+adversarial Cornuéjols & Dawande 1999 construction whose binary columns have
+integer-valued matrix coefficients that this reduction alone does not
+exploit) — not attempted here. An adversarial-generator fuzz gate (mirroring
+`tests/lp/adversarial_lp_generator.hpp`'s existing role for other presolve/
+cut work) was also considered and scoped out for this increment, given the
+soundness argument above is unconditional rather than empirically fragile,
+unlike the fill-ordering work earlier this session — a candidate for a
+future pass if this reduction is ever extended to a less trivially-sound
+form.
+
 ## 2. Cuts
 
 ### 2.1 Root mixed-row cover cuts (implemented root mixed-row cover subset)

@@ -83,6 +83,10 @@ int main(int argc, char** argv) {
     // that option's own default (docs/architecture/MILP.md \S3), so a
     // plain invocation reproduces the existing baseline exactly.
     const bool gmi_cuts = argc > 7 && std::string(argv[7]) == "on";
+    // MilpSolverOptions::enable_integer_bound_rounding: off by default,
+    // matching that option's own default, so a plain invocation reproduces
+    // the existing baseline exactly.
+    const bool integer_bound_rounding = argc > 8 && std::string(argv[8]) == "on";
 
     std::cout << std::unitbuf;
 
@@ -107,6 +111,7 @@ int main(int argc, char** argv) {
     std::cout << "time_limit_seconds=" << time_limit << " branching_rule=" << branching_rule
               << " warm_start=" << (warm_start ? "on" : "off")
               << " gmi_cuts=" << (gmi_cuts ? "on" : "off")
+              << " integer_bound_rounding=" << (integer_bound_rounding ? "on" : "off")
               << " gpu_available=" << (process_start.gpu_available ? "yes" : "no") << '\n';
     std::cout << std::left << std::setw(18) << "instance" << std::right << std::setw(12)
               << "status" << std::setw(18) << "ours" << std::setw(18) << "reference"
@@ -137,6 +142,7 @@ int main(int argc, char** argv) {
             options.use_rounding_heuristic = true;
             options.warm_start_node_relaxations = warm_start;
             options.enable_root_gmi_cuts = gmi_cuts;
+            options.enable_integer_bound_rounding = integer_bound_rounding;
             if (branching_rule == "most") {
                 options.branching_rule = sihps::MilpBranchingRule::MOST_FRACTIONAL;
             } else if (branching_rule == "pseudocost") {

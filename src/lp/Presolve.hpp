@@ -74,6 +74,7 @@ struct PresolveResult {
 //   - forcing row          : activity bound meets the row bound exactly, so
 //                            every variable in it is pinned to one bound
 //   - activity-based bound tightening (bound propagation)
+//   - integer bound rounding (see `integer_columns` below)
 //
 // Reductions deliberately NOT applied, and why: doubleton-equation
 // substitution and free-column-singleton substitution both change the
@@ -89,7 +90,26 @@ struct PresolveResult {
 // tolerance by a margin. A presolve that is aggressive at the tolerance
 // boundary can turn a feasible model infeasible, which is a far worse
 // failure than leaving a reduction on the table.
-PresolveResult presolve(const LpProblem& problem, int max_passes = 20);
+//
+// `integer_columns`, empty by default: this LP-level presolve has no notion
+// of integrality on its own -- deliberately, so an ordinary LP caller is
+// never affected by it (see MilpProblem.hpp's own note that "the LP engine
+// never sees this metadata" by default). A MILP caller that has ALREADY
+// determined, from the original model, which columns are integer-restricted
+// may opt in explicitly by passing a mask the same size as the problem's
+// column count (nonzero = integer). When present, every bound this pass
+// derives or is given for an integer column is additionally rounded inward
+// to the nearest integer (`ceil` for a lower bound, `floor` for an upper
+// bound) -- ESTABLISHED METHOD, unconditionally sound: any integer-feasible
+// x_j respects the rounded bound exactly as it respected the original one.
+// This requires no new postsolve machinery: it only narrows a box bound,
+// never removes a column, so `postsolve()` below is already correct for it
+// unmodified. A mask whose size is neither 0 nor the column count is
+// treated as if no column were flagged integer, rather than indexed
+// out of bounds -- this is a defensive guard against a caller bug, not a
+// scenario this function's own contract expects to occur.
+PresolveResult presolve(const LpProblem& problem, int max_passes = 20,
+                         const std::vector<char>& integer_columns = {});
 
 // Expands a solution of the reduced problem back into ORIGINAL column
 // space: kept columns take their solved value, removed columns take the

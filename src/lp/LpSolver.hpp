@@ -112,6 +112,15 @@ struct LpSolverOptions {
     // and what the future warm-started MILP caller will need to request the
     // dual path deliberately.
     LpAlgorithm algorithm = LpAlgorithm::AUTO;
+
+    // Threaded straight through to presolve()'s own `integer_columns`
+    // parameter (see Presolve.hpp). Empty by default, so an ordinary LP
+    // caller is completely unaffected -- this exists for MilpSolver's node
+    // relaxations, which DO know, from the original model, which columns
+    // are integer-restricted, and opt in explicitly rather than this engine
+    // inferring it (see MilpProblem.hpp's own note on why the LP engine
+    // does not see integrality metadata by default).
+    std::vector<char> integer_columns;
 };
 
 struct LpSolution {

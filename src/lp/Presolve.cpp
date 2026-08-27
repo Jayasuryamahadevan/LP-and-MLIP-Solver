@@ -67,12 +67,20 @@ struct Activity {
 
 } // namespace
 
-PresolveResult presolve(const LpProblem& problem, int max_passes) {
+PresolveResult presolve(const LpProblem& problem, int max_passes,
+                         const std::vector<char>& integer_columns) {
     PresolveResult result;
     const std::int32_t m = problem.n_rows();
     const std::int32_t n = problem.n_cols();
     result.original_n_rows = m;
     result.original_n_cols = n;
+
+    // See Presolve.hpp's own comment on `integer_columns`: bounds-checked
+    // rather than assumed to be sized `n`, since a mismatched mask is a
+    // caller bug this function should not turn into out-of-bounds access.
+    const auto is_integer_column = [&](std::size_t jj) {
+        return jj < integer_columns.size() && integer_columns[jj] != 0;
+    };
 
     const CSRMatrix& A = problem.A;
     const CSCMatrix A_csc = csr_to_csc(A);
@@ -92,6 +100,18 @@ PresolveResult presolve(const LpProblem& problem, int max_passes) {
 
     std::vector<double> col_lo = problem.lower;
     std::vector<double> col_hi = problem.upper;
+
+    // Round the ORIGINAL bounds of any integer-restricted column inward
+    // before the pass loop even starts, covering a fractional bound given
+    // directly in the model (the common case -- a bound derived later by
+    // propagation or a singleton row -- goes through tighten_lower/
+    // tighten_upper below instead, which apply the same rounding).
+    for (std::int32_t j = 0; j < n; ++j) {
+        const auto jj = static_cast<std::size_t>(j);
+        if (!is_integer_column(jj)) continue;
+        if (std::isfinite(col_lo[jj])) col_lo[jj] = std::ceil(col_lo[jj]);
+        if (std::isfinite(col_hi[jj])) col_hi[jj] = std::floor(col_hi[jj]);
+    }
 
     std::vector<char> row_active(static_cast<std::size_t>(m), 1);
     std::vector<char> col_active(static_cast<std::size_t>(n), 1);
@@ -198,7 +218,17 @@ PresolveResult presolve(const LpProblem& problem, int max_passes) {
     // reduction for a wrong answer.
     const auto tighten_upper = [&](std::size_t jj, double limit) {
         if (!std::isfinite(limit)) return false;
-        const double relaxed = limit + kBoundRelax * (1.0 + std::fabs(limit));
+        double relaxed = limit + kBoundRelax * (1.0 + std::fabs(limit));
+        // Integer columns: tighten further to the nearest integer, applied
+        // to the already-outward-padded `relaxed` value rather than the raw
+        // `limit` -- this is what lets a limit that is really exactly
+        // integer N, but landed at N-epsilon from floating-point noise in
+        // the derivation above, still round to N rather than N-1. See
+        // Presolve.hpp's own comment on `integer_columns` for the soundness
+        // argument (unconditional: any integer-feasible x_j already
+        // respects floor(relaxed) whenever it respects the un-rounded
+        // bound).
+        if (is_integer_column(jj)) relaxed = std::floor(relaxed);
         if (relaxed < col_lo[jj]) return false; // would cross: numerically unreliable
         const double current = col_hi[jj];
         if (!std::isfinite(current)) {
@@ -213,7 +243,8 @@ PresolveResult presolve(const LpProblem& problem, int max_passes) {
     };
     const auto tighten_lower = [&](std::size_t jj, double limit) {
         if (!std::isfinite(limit)) return false;
-        const double relaxed = limit - kBoundRelax * (1.0 + std::fabs(limit));
+        double relaxed = limit - kBoundRelax * (1.0 + std::fabs(limit));
+        if (is_integer_column(jj)) relaxed = std::ceil(relaxed); // see tighten_upper's comment
         if (relaxed > col_hi[jj]) return false; // would cross: numerically unreliable
         const double current = col_lo[jj];
         if (!std::isfinite(current)) {
