@@ -330,6 +330,82 @@ SIHPS_TEST(basis_factorization_btran_correct_when_pivot_order_permutes_rows) {
     check_btran(b, {0.0, 0.0, 1.0}, 1e-10);
 }
 
+// Unit-vector and other genuinely sparse right-hand sides are exactly the
+// shape a single entering STRUCTURAL column feeds ftran() in the simplex
+// hot path (docs/architecture/LP.md \S9's own FTRAN follow-up). The
+// existing check_ftran-based tests above use dense-ish random RHS, which
+// mostly exercises the density fallback rather than reach() itself --
+// these pin the sparse-seed DFS path specifically, mirroring the
+// analogous btran() tests directly above.
+
+SIHPS_TEST(basis_factorization_ftran_matches_dense_on_unit_vector_rhs) {
+    std::mt19937 rng(2025);
+    const std::int32_t m = 30;
+    Dense b = random_nonsingular(m, 0.15, rng);
+    for (std::int32_t row = 0; row < m; ++row) {
+        std::vector<double> unit(static_cast<std::size_t>(m), 0.0);
+        unit[static_cast<std::size_t>(row)] = 1.0;
+        check_ftran(b, unit, 1e-8);
+    }
+}
+
+SIHPS_TEST(basis_factorization_ftran_matches_dense_on_sparse_rhs_after_updates) {
+    std::mt19937 rng(100);
+    const std::int32_t m = 22;
+    Dense b = random_nonsingular(m, 0.15, rng);
+
+    BasisFactorization factor;
+    SIHPS_ASSERT_TRUE(factor.factorize(m, to_columns(b)).ok);
+
+    // Several PFI updates first, so the eta file is nonempty -- ftran()'s
+    // eta phase stays dense by design (mirroring btran()'s), and this
+    // checks the sparse DFS phase upstream of it still sees the correct
+    // pre-eta pattern against the updated matrix.
+    std::uniform_real_distribution<double> value(-3.0, 3.0);
+    for (std::int32_t update_index = 0; update_index < 8; ++update_index) {
+        const std::int32_t leaving = update_index % m;
+        std::vector<double> entering(static_cast<std::size_t>(m), 0.0);
+        for (auto& v : entering) v = value(rng);
+        entering[static_cast<std::size_t>(leaving)] += 12.0;
+
+        std::vector<double> direction = entering;
+        factor.ftran(direction);
+        SIHPS_ASSERT_TRUE(factor.update(leaving, direction));
+
+        for (std::int32_t row = 0; row < m; ++row) {
+            b[static_cast<std::size_t>(row)][static_cast<std::size_t>(leaving)] =
+                entering[static_cast<std::size_t>(row)];
+        }
+    }
+
+    for (std::int32_t row : {0, 5, m - 1}) {
+        std::vector<double> unit(static_cast<std::size_t>(m), 0.0);
+        unit[static_cast<std::size_t>(row)] = 1.0;
+        std::vector<double> x = unit;
+        factor.ftran(x);
+        for (std::int32_t r = 0; r < m; ++r) {
+            double accumulated = 0.0;
+            for (std::int32_t col = 0; col < m; ++col) {
+                accumulated += b[static_cast<std::size_t>(r)][static_cast<std::size_t>(col)] *
+                                x[static_cast<std::size_t>(col)];
+            }
+            SIHPS_ASSERT_NEAR(accumulated, unit[static_cast<std::size_t>(r)], 1e-6);
+        }
+    }
+}
+
+// The ftran() analogue of the btran() regression directly above: a
+// natural first pivot of zero, forcing row reordering, checked against
+// every unit-vector RHS so a pivot-order/permutation bug in the FORWARD
+// solve specifically cannot hide.
+SIHPS_TEST(basis_factorization_ftran_correct_when_pivot_order_permutes_rows) {
+    Dense b = {{0, 2, 1}, {1, 0, 3}, {4, 5, 0}};
+    check_ftran(b, {1.0, 1.0, 1.0}, 1e-10);
+    check_ftran(b, {1.0, 0.0, 0.0}, 1e-10);
+    check_ftran(b, {0.0, 1.0, 0.0}, 1e-10);
+    check_ftran(b, {0.0, 0.0, 1.0}, 1e-10);
+}
+
 // A zero pivot must be refused rather than producing infinities.
 SIHPS_TEST(basis_factorization_update_rejects_tiny_pivot) {
     Dense b = {{1, 0}, {0, 1}};

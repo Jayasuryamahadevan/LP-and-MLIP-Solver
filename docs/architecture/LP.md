@@ -471,3 +471,95 @@ correctness bug, and the allocation-driven small-instance slowdown) rather
 than papered over. No KPI regression on the existing benchmark suite —
 128/128 unit tests pass (3 new, added for this change), and every
 Netlib/MIPLIB verdict is unchanged from before this change.
+
+### Hyper-sparse FTRAN — attempted, mathematically correct, reverted: a real solvability regression on a degenerate instance
+
+`IMPLEMENTED` (then reverted), `MEASURED`. The deferred v2 candidate named
+above was attempted, following exactly the same pattern as BTRAN's own
+hyper-sparse solve: `ftran()`'s L-phase and U-phase each gated by
+reachability (Gilbert & Peierls 1988) with the same density fallback,
+reusing `reach()` directly against `Lp_`/`Li_` and `Up_`/`Ui_` (their own
+native column-major storage already is the right adjacency for a
+FORWARD/BACKWARD solve in each factor's own natural direction — unlike
+BTRAN's opposite-direction solves, no `build_transpose`-equivalent pass
+was needed; a small `diagonal_skip` parameter on the existing `reach()`
+let it walk `Lp_`/`Up_` directly instead of a dedicated transpose graph).
+
+**Correctness: verified exhaustively, no defect found.** `check_ftran`
+(this project's own dense-reference verifier — `Bx = rhs` checked
+directly against the dense matrix, independent of any assumption about
+DFS ordering) already covered identity, permutation, triangular,
+pivoting-required, and 25 random-sparse-matrix cases; three more tests
+were added specifically for genuinely sparse RHS (unit vectors, sparse
+RHS after several PFI updates, and the exact pivot-permuting 3x3 case
+that caught BTRAN's own mark-collision bug) to exercise the `reach()`
+path rather than only the density fallback. **All 145 tests passed,
+including every new one, with zero failures at any point in this work.**
+This is stated explicitly because what killed this change was NOT a
+logic bug of the kind unit testing catches.
+
+**What actually happened: a real solvability regression, root-caused
+precisely, not guessed at.** A full `validate_netlib` sweep after this
+change showed `pilot87` (2,030 rows, one of the harder/more degenerate
+Netlib instances — its own reference is sourced `summary`, not the
+cleaner `cplex`/`minos` columns) intermittently failing: of several
+repeated runs, some reported `OPTIMAL` with the objectively correct
+answer, and some reported `ITER_LIMIT` — a genuine stall, not a
+near-miss. This is not a tolerance-boundary flicker; `ITER_LIMIT` means
+the search did not converge in budget at all. Compared directly against
+`docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`, recorded
+**before** this change: `pilot87` was 100% bit-identical across 3
+repeats then (`repeats_deterministic: true`, 14,071 iterations every
+time) — this instance was not already fragile; the regression is
+attributable to this change.
+
+Root cause, isolated by direct experiment rather than assumed:
+`OMP_NUM_THREADS=1` against the **exact same hyper-sparse FTRAN binary**
+made `pilot87` 100% stable again (2/2 identical runs, matching the
+correct objective `301.71065562` exactly) — proving the mechanism is not
+a defect in the hyper-sparse solve's arithmetic, but an *interaction*:
+this project's existing OpenMP-parallel reductions (SpMV, pricing) are
+already not guaranteed to sum in a fixed order across runs — an already-
+known, already-documented characteristic (`docs/measurements/README.md`'s
+own account of concurrent-benchmark contamination is a different symptom
+of the same underlying fact: floating-point summation order is not fixed
+under this project's parallel execution). Hyper-sparse FTRAN changes
+*which* order entries are processed in (DFS/topological order instead of
+always-ascending column order), which changes the floating-point rounding
+of the computed pivot direction. On a well-conditioned instance this is
+invisible. On `pilot87` specifically — large and degenerate enough that
+its pivot sequence is already close to a ratio-test tie in multiple
+places — the altered rounding was, in some but not all runs, enough to
+flip a close tie and send the search down a path that stalls, where the
+dense FTRAN's fixed summation order apparently did not (at least not with
+comparable frequency in the runs measured).
+
+**Disposition: reverted, not shipped behind a flag.** Unlike GMI cuts or
+MILP node warm-starting (both shipped off-by-default, because their
+failure mode was "doesn't help enough," never "sometimes doesn't
+converge"), this failure mode — intermittent non-convergence on a real
+Netlib instance, under this project's actual default multi-threaded
+configuration — is exactly the kind of regression `docs/ROADMAP_STATUS.md`
+Phase 1 exists to catch, and no default-off flag makes it acceptable to
+leave implemented and reachable. `src/lp/BasisFactorization.{hpp,cpp}`
+were reverted to the pre-change dense `ftran()` (verified: `pilot87`
+stable again post-revert, matching the pre-change baseline). The three
+new sparse-RHS FTRAN tests were **kept** (`tests/lp/test_basis_
+factorization.cpp`) — they test the dense path correctly and add real
+regression coverage regardless of this outcome.
+
+**What this means for a future attempt, recorded as a `RESEARCH
+HYPOTHESIS` rather than closing the door:** the failure mode here is
+about *summation-order sensitivity interacting with a pre-existing
+parallel-floating-point noise source*, not about the hyper-sparse
+technique being wrong. A future attempt would need to either (a) make the
+hyper-sparse solve's summation order match the dense sweep's own order
+more closely when both visit the same entries (losing some of the
+technique's benefit but preserving bitwise-closer behavior), or (b)
+address the underlying parallel non-determinism directly rather than
+adding a second computation path that turns out to be more sensitive to
+it, or (c) accept the risk only behind an explicit opt-in flag with this
+exact failure mode documented at the call site — not attempted in this
+pass, and not recommended as the next default action given items 1-3 of
+`docs/research/HIGHS_GAP_ANALYSIS.md`'s own ranked candidate list (§6) do
+not depend on this line of work at all.

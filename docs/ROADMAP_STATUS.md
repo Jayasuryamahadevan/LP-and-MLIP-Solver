@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 142 / 142 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot + 6 adversarial-LP cases, the last covering 400 generated instances) |
+| unit tests | 145 / 145 | `ctest` (128 pre-existing + 5 GMI-cut + 3 ResourceSnapshot + 6 adversarial-LP + 3 sparse-RHS FTRAN cases, the adversarial-LP set covering 400 generated instances) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -496,13 +496,39 @@ benchmark-ready, which is now the top item below.
    actual gate — neither is this session's top item right now, but
    noted so Phase 1 is not claimed fully closed. **Now the top item:
    item 4 below.**
-4. **Hyper-sparse FTRAN** (BTRAN is now done — `docs/architecture/LP.md`
-   §9), then Markowitz/AMD ordering and presolve expansion.
-5. Feasibility polishing for the six stalling PDLP instances.
-6. Layer D refinery generator — without it, no refinery claim is admissible.
-7. Resume MILP cut work (§1 above, PAUSED not abandoned) with the
+4. ~~Hyper-sparse FTRAN~~ — **attempted, mathematically correct (145/145
+   tests, including 3 new sparse-RHS cases, all passed — kept), but
+   REVERTED**: caused `pilot87` to intermittently stall (`ITER_LIMIT`,
+   not a near-miss) under this project's actual default multi-threaded
+   configuration, where it was 100% deterministic and convergent before
+   this change (`docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`).
+   Root-caused by direct experiment (single-threaded: 100% stable on the
+   identical binary) to an interaction between the hyper-sparse solve's
+   changed summation order and this project's pre-existing OpenMP
+   floating-point non-associativity, not a logic defect. Full account:
+   `docs/architecture/LP.md`'s new "Hyper-sparse FTRAN" subsection under
+   §9. **Now the top item, per `docs/research/HIGHS_GAP_ANALYSIS.md`'s
+   own ranked candidate list (§6), which reaches the same conclusion
+   independently: Markowitz/AMD ordering.**
+5. **Markowitz/AMD fill-reducing ordering for basis factorization** —
+   `docs/research/HIGHS_GAP_ANALYSIS.md` §2.2/§6/§7: the single
+   highest-confidence remaining lever for closing the measured 7.25x
+   HiGHS LP-speed gap (`docs/measurements/highs_comparison.md`), and the
+   most direct literature-supported "standard, expected" piece this
+   project's factorization is still missing. Benchmark on `stocfor3` for
+   direct comparability with the BTRAN measurement.
+6. Feasibility polishing for the six stalling PDLP instances.
+7. Layer D refinery generator — without it, no refinery claim is admissible.
+8. Resume MILP cut work (§1 above, PAUSED not abandoned) with the
    density-based hypothesis, once items 2-3 have made further correctness
-   infrastructure progress.
+   infrastructure progress. `docs/research/HIGHS_GAP_ANALYSIS.md` §5-6
+   independently identifies two further, previously-unnamed MILP levers
+   worth folding into this line of work when it resumes: MIP-specific
+   presolve (probing, clique merging, dual fixing on integers — currently
+   completely absent, confirmed by reading `docs/architecture/MILP.md`
+   directly) and a RENS-class primal heuristic (this project has only
+   safe-rounding + LP diving; HiGHS ships RENS/RINS/feasibility-jump by
+   default).
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes
