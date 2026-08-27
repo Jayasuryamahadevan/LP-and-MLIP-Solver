@@ -1,0 +1,23 @@
+========= COMPUTE-SANITIZER
+GPU: NVIDIA GeForce RTX 3050 A Laptop GPU (CC 8.9, 14 SMs)
+VRAM: 3.91 GB total, 2.44 GB free at benchmark start
+
+         n        nnz    CPU us/call  GPU-kernel us   GPU-rtrip us   GFLOP/s(CPU)    speedup
+------------------------------------------------------------------------------------------------
+       200       2007           1.35         143.16         211.77          2.982      0.01x
+      1000      10018           5.02         165.58         235.46          3.989      0.03x
+      5000      49998        5899.91         251.55         332.65          0.017     23.45x
+     10000      99996          11.45         414.51         502.70         17.469      0.03x
+     20000     199572        1013.90         813.57         910.63          0.394      1.25x
+     40000     400256          51.27        1428.38        1532.62         15.612      0.04x
+
+Notes:
+  - 'GPU-kernel' isolates the cuSPARSE SpMV call itself (device-resident x/y,
+    no PCIe transfer per call) -- the H1-relevant number.
+  - 'GPU-rtrip' includes host<->device transfer each call -- the realistic
+    cost if this were invoked once per B&B node without keeping x device-
+    resident across calls.
+  - 'speedup' = CPU time / GPU-kernel time. <1.0x means CPU was faster.
+  - These are measurements on this specific RTX 3050 Laptop (4.29GB, 14 SMs),
+    not a claim about datacenter-GPU behavior (docs/research/SOTA.md \S0).
+========= ERROR SUMMARY: 0 errors

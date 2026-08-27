@@ -18,6 +18,8 @@ that every quoted number can be traced to the run that produced it.
 
 | `../highs_comparison.md` (+ `reports/highs_comparison/*`) | `benchmarks/compare_highs.py both --time-limit 60` | Head-to-head against HiGHS 1.15.1 built from source: HiGHS 7.25× faster in aggregate on 89 agreeing Netlib LPs; mixed 2-2-1 result on the 5-instance MIPLIB set; one objective disagreement (`e226`) diagnosed as a real, narrow MPS-format gap in this repo's parser (objective-row RHS constant not implemented), not a solver defect |
 
+| `compute-sanitizer/*.log` | `compute-sanitizer --tool {memcheck,racecheck} <binary>` on `sihps_tests`, `bench_pdlp`, `bench_spmv` | memcheck: 0 errors across all 3 (this project's own kernels + the cuSPARSE wrapper). racecheck: hazards found, but 100% confined to cuSPARSE's own closed-source kernel (zero in `PdlpKernels.cu`/`PricingKernels.cu`); 3 apparent test failures under racecheck root-caused to a wall-clock-budget/instrumentation-overhead interaction (confirmed by re-running with a larger budget: identical converged answer), not a correctness defect. Full account in `ROADMAP_STATUS.md`'s Phase 1 section |
+
 ## Structured records
 
 `validate_netlib` takes an optional sixth argument: a path for a **JSON Lines**

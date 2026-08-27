@@ -1,0 +1,18 @@
+========= COMPUTE-SANITIZER
+GPU: NVIDIA GeForce RTX 3050 A Laptop GPU (CC 8.9, 14 SMs)
+eps = 1e-08   restart period = 64   time limit = 20.0 s   adaptive step = on
+
+    instance   rows   cols      nnz | PDLP iter   syncs  rstrt  PDLP sec |  KKT worst   obj err |  CPU sec verdict
+------------------------------------------------------------------------------------------------------------------------------------
+       afiro     27     32       83 |       640      22      6     0.392 |   4.23e-09  4.50e-09 |    0.000 OPTIMAL
+       sc50b     50     48      118 |      1472      48     10     0.833 |   8.60e-09  6.35e-09 |    0.000 OPTIMAL
+       sc50a     50     48      130 |      1216      40      9     0.693 |   3.72e-09  7.80e-09 |    0.000 OPTIMAL
+         kb2     43     41      286 |     25856     810     21    15.078 |   8.53e-09  8.19e-12 |    0.000 OPTIMAL
+    adlittle     56     97      383 |     16768     526     21     9.839 |   3.91e-09  7.78e-09 |    0.001 OPTIMAL
+
+====================================================================================================================================
+attempted 5   converged 5   converged AND within 1e-6 of the published optimum 5
+on converged instances: PDLP 26.835 s total
+where the CPU simplex also ran: PDLP 26.835 s   CPU 0.002 s   (PDLP 0.00x)
+iterations 45952 across 1446 host syncs -- 32 iterations per sync
+========= ERROR SUMMARY: 0 errors

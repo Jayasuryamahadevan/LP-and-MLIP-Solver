@@ -1,0 +1,30 @@
+  ill_conditioned: 60/60 independently verified within relaxed tolerance
+[PASS] adversarial_ill_conditioned_lps_are_never_falsely_infeasible_or_unbounded
+[PASS] adversarial_degenerate_lps_are_never_falsely_infeasible_or_unbounded
+[PASS] adversarial_infeasible_bound_contradictions_are_always_detected
+[PASS] adversarial_infeasible_row_contradictions_are_always_detected
+[PASS] adversarial_unbounded_directions_are_always_detected
+[PASS] milp_finds_integer_optimum_with_fractional_lp_root
+[PASS] milp_handles_general_integer_variables
+[PASS] milp_reports_maximization_objective_in_original_sense
+[PASS] milp_proves_integer_infeasibility_by_exhausting_nodes
+[PASS] milp_node_limit_is_not_reported_as_optimal
+[PASS] milp_root_cover_cut_is_valid_and_improves_the_root_relaxation
+[PASS] milp_mixed_nonnegative_packing_row_gets_valid_cover_cut
+[PASS] milp_unit_bounded_integer_variables_get_binary_cover_cuts
+[PASS] gmi_cut_from_l_row_slack_at_lower_bound_certifies_root_in_one_node
+[PASS] gmi_cut_from_l_row_is_required_for_one_node_certification
+[PASS] gmi_cut_from_g_row_slack_at_upper_bound_certifies_root_in_one_node
+[PASS] gmi_cut_from_g_row_is_required_for_one_node_certification
+[PASS] gmi_cut_rejects_row_with_near_integer_basic_fraction
+[PASS] milp_maps_unbounded_pure_continuous_relaxation_to_unbounded
+[PASS] mps_integer_markers_and_binary_bounds_are_preserved
+[PASS] mps_maximize_sense_is_converted_and_reported_correctly
+[PASS] milp_warm_start_matches_cold_start_on_binary_knapsack
+[PASS] milp_warm_start_matches_cold_start_on_mixed_nonnegative_packing_row
+[PASS] milp_warm_start_reproduces_tiny_milp_mps_result
+[PASS] milp_warm_start_fallback_counter_is_zero_or_explained
+
+139 passed, 3 failed, 142 total
+========= Target application returned an error
+========= RACECHECK SUMMARY: 100 hazards displayed (16204 errors, 15161 warnings)

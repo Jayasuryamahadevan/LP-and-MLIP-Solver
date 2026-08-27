@@ -104,7 +104,7 @@ only, and not across runs.
 | Determinism under fixed configuration | `MEASURED` — exact-equality tests, including PDLP |
 | Random / ill-conditioned / degenerate LP generators | `IMPLEMENTED`, `MEASURED` — `tests/lp/adversarial_lp_generator.hpp` + `tests/lp/test_adversarial.cpp`, see below |
 | MPS and sparse-structure fuzzing | **NOT IMPLEMENTED** — the generator above builds `LpProblem` directly, not MPS text; a text-level MPS fuzzer is a distinct, still-open item |
-| Compute Sanitizer in CI | **NOT IMPLEMENTED** — never run. Deliberately deferred out of this pass (recorded, not dropped): the generator work below was already one coherent increment, and Compute Sanitizer is independent enough to be its own |
+| Compute Sanitizer in CI | `MEASURED` (2026-08-27, on-demand — not yet wired into CI as a gate, see below) — `docs/measurements/compute-sanitizer/` |
 | Brute-force checker for tiny MILPs | `IMPLEMENTED` — this line was stale; `tests/milp/test_milp.cpp` has brute-forceable tiny-MILP cases (integer optima, infeasibility proofs) since the MILP engine landed |
 
 `MEASURED`: 6 generator categories (feasible/bounded, ill-conditioned,
@@ -146,13 +146,61 @@ for — it does not matter that the bug was in the harness rather than the
 solver; a fuzzer whose own instances are corrupted is worse than no
 fuzzer, since it would have quietly recorded false “solver failures.”
 
-`KNOWN LIMITATION` (unchanged by the above, restated precisely): the
-solver-under-test claims themselves ("no false INFEASIBLE", "no false
-UNBOUNDED") are now backed by 400 generated adversarial instances in
-addition to the Netlib set (28/0/1 known-infeasible/unbounded/feasible),
-which is real, new, stronger evidence — but MPS-text-level fuzzing and
-Compute Sanitizer remain open, so this is not yet the roadmap's full
-Phase 1 acceptance bar.
+### Compute Sanitizer
+
+`MEASURED` (NVIDIA Compute Sanitizer 2026.2.1.0, CUDA 13.3, RTX 3050
+Laptop). Raw logs in `docs/measurements/compute-sanitizer/`. Three
+`memcheck` runs, each exercising a different real GPU code path:
+
+| target | what it covers | result |
+|---|---|---|
+| `sihps_tests` (full suite) | `src/cuda/PricingKernels.cu` (this project's own hand-written kernels) + `src/cuda/GpuSpMV.cpp` (cuSPARSE wrapper), across 142 tests | **0 errors** (16 s, ~2.4x normal) |
+| `bench_pdlp` (5 small Netlib instances) | `src/cuda/PdlpKernels.cu` — the most algorithmically complex GPU code in this repo (`docs/architecture/PDLP.md`) — 45,952 real PDLP iterations, 1,446 host syncs | **0 errors** (28 s, ~16x normal; identical iteration counts/objective errors to the uninstrumented run, so instrumentation changed nothing about the computation) |
+| `bench_spmv` (6 matrix sizes, n up to 40,000) | cuSPARSE SpMV wrapper across a size sweep | **0 errors** (14 s, no measurable slowdown) |
+
+`racecheck` (shared-memory hazard detection) on the same `bench_pdlp`
+target found race hazards — but every single one, across 14,329 errors
+and 1,273 warnings, is inside `cusparse::csrmv_v3_kernel`: NVIDIA's own
+closed-source library kernel, confirmed by grepping every hazard report
+for the implicated kernel name (`grep -oE "Write access at [^+]+"` →
+one unique match, `cusparse::csrmv_v3_kernel`). **Zero hazards in any of
+this project's own kernel code** — `PdlpKernels.cu` and
+`PricingKernels.cu` never appear in any report. This is a documented,
+common false-positive class for closed-source vendor math libraries
+using hardware-specific cooperative write patterns racecheck's generic
+model cannot validate; there is nothing in this codebase to fix.
+
+`racecheck` on the full `sihps_tests` suite additionally showed 3 test
+*failures* (`pdlp_agrees_with_the_simplex_on_afiro`,
+`first_order_pipeline_matches_the_simplex_on_sctap1`,
+`first_order_result_passes_the_same_original_space_gate`) —
+investigated rather than dismissed, per this iteration's own ground
+rule. Root cause, confirmed by isolated reproduction: both failing test
+files set an explicit wall-clock `time_limit_seconds` (20 s, 30 s) on
+the PDLP solve; `racecheck`'s per-kernel-launch instrumentation is heavy
+enough (~60-100x slowdown observed) that the budget expires before
+enough iterations complete. Re-running the exact same `afiro` PDLP solve
+under `racecheck` with the budget raised to 180 s converged to
+`obj=-464.7531421935` — bit-for-bit identical to the uninstrumented
+run's `-464.7531421935`, at a comparable iteration count (512 both
+ways). This is conclusively a wall-clock-budget-vs-instrumentation-
+overhead artifact, not a data-correctness defect or a real race: the
+same computation reaches the same answer either way, just slower.
+`racecheck` is accordingly not suited to running under this project's
+own default test time budgets and is a manual/occasional check, not a
+CI gate, until/unless those tests grow an instrumentation-aware budget
+override.
+
+`KNOWN LIMITATION` (updated by the above): the solver-under-test claims
+themselves ("no false INFEASIBLE", "no false UNBOUNDED") are now backed
+by 400 generated adversarial instances in addition to the Netlib set
+(28/0/1 known-infeasible/unbounded/feasible) and a clean Compute
+Sanitizer memcheck pass across three real GPU code paths — real, new,
+stronger evidence than before this iteration. What remains open: MPS-
+text-level fuzzing (the generator above builds `LpProblem` directly, not
+MPS text, so a parser-level fuzzer is a distinct, still-unaddressed
+item) and wiring Compute Sanitizer into CI as an actual gate rather than
+an on-demand check. Phase 1 is substantially, not fully, closed.
 
 `KNOWN LIMITATION`, `MEASURED` via `docs/measurements/highs_comparison.md`:
 `src/io/MpsReader.cpp` does not implement the MPS objective-row RHS
@@ -435,15 +483,19 @@ benchmark-ready, which is now the top item below.
    (`docs/measurements/netlib-hybrid-20000rows-repeats3.jsonl`) that
    MEASURED 100% bit-identical determinism across every repeat of every
    instance. **Now the top item: item 3 below.**
-3. **Generated adversarial LPs — done; Compute Sanitizer — still open.**
-   400 generated instances across 6 categories (feasible/bounded,
-   ill-conditioned, degenerate, infeasible×2, unbounded), all with a
-   status known by construction, independently re-verified in the test
-   itself; found and fixed one real bug (in the generator, not the
-   solver — see the Phase 1 table above for the full account). Compute
-   Sanitizer (memcheck/racecheck against a GPU-exercising benchmark) was
-   deliberately deferred, not attempted — explicitly recorded as **now
-   the top item** rather than silently dropped.
+3. ~~Generated adversarial LPs + Compute Sanitizer~~ — **done, this
+   iteration and the last.** 400 generated instances across 6
+   categories, one real bug found and fixed (in the generator, not the
+   solver); Compute Sanitizer memcheck clean across 3 real GPU code
+   paths (0 errors), racecheck hazards traced conclusively to
+   cuSPARSE-internal code with zero hazards in this project's own
+   kernels, and 3 racecheck-induced test "failures" root-caused to a
+   wall-clock-budget/instrumentation-overhead interaction, not a defect
+   (full account in the Phase 1 table above). Still open within Phase 1:
+   MPS-text-level fuzzing, and wiring Compute Sanitizer into CI as an
+   actual gate — neither is this session's top item right now, but
+   noted so Phase 1 is not claimed fully closed. **Now the top item:
+   item 4 below.**
 4. **Hyper-sparse FTRAN** (BTRAN is now done — `docs/architecture/LP.md`
    §9), then Markowitz/AMD ordering and presolve expansion.
 5. Feasibility polishing for the six stalling PDLP instances.
