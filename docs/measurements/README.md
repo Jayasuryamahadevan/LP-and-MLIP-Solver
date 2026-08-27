@@ -20,6 +20,8 @@ that every quoted number can be traced to the run that produced it.
 
 | `compute-sanitizer/*.log` | `compute-sanitizer --tool {memcheck,racecheck} <binary>` on `sihps_tests`, `bench_pdlp`, `bench_spmv` | memcheck: 0 errors across all 3 (this project's own kernels + the cuSPARSE wrapper). racecheck: hazards found, but 100% confined to cuSPARSE's own closed-source kernel (zero in `PdlpKernels.cu`/`PricingKernels.cu`); 3 apparent test failures under racecheck root-caused to a wall-clock-budget/instrumentation-overhead interaction (confirmed by re-running with a larger budget: identical converged answer), not a correctness defect. Full account in `ROADMAP_STATUS.md`'s Phase 1 section |
 
+| `../gurobi_comparison.md` (+ `reports/gurobi_comparison/*`) | `external/gurobi-venv/bin/python benchmarks/compare_gurobi.py --time-limit 60` | Three-way LP comparison (ours/HiGHS/Gurobi) on the 63/90 instances that fit under gurobipy's free no-registration license cap (2000x2000). Gurobi is fastest (1.6x faster than HiGHS, ~10x faster than ours, in aggregate on this subset); ours beat both on 1/61 agreeing instances. One new, unresolved 3-way objective disagreement (`forplan`: ours+HiGHS agree, Gurobi differs) recorded honestly rather than guessed at |
+
 ## Structured records
 
 `validate_netlib` takes an optional sixth argument: a path for a **JSON Lines**

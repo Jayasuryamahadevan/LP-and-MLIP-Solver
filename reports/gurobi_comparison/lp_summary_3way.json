@@ -1,0 +1,16 @@
+{
+  "gurobi_version": "(13, 0, 3)",
+  "gurobi_license": "restricted (no-registration, free trial), non-production, <=2000x2000",
+  "instances_in_cap": 63,
+  "instances_total": 90,
+  "three_way_objective_agreement": 61,
+  "total_seconds_ours": 4.723631157,
+  "total_seconds_highs": 0.7500000000000001,
+  "total_seconds_gurobi": 0.4564105469999049,
+  "fastest_count": {
+    "ours": 1,
+    "highs": 27,
+    "gurobi": 33
+  },
+  "ours_beats_both_count": 1
+}
