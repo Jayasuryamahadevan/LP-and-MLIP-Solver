@@ -110,6 +110,10 @@ int main(int argc, char** argv) {
     // own default, so a plain invocation of this benchmark reproduces the
     // existing baseline exactly.
     const bool warm_start = argc > 6 && std::string(argv[6]) == "on";
+    // MilpSolverOptions::enable_root_gmi_cuts: off by default, matching
+    // that option's own default (docs/architecture/MILP.md \S3), so a
+    // plain invocation reproduces the existing baseline exactly.
+    const bool gmi_cuts = argc > 7 && std::string(argv[7]) == "on";
 
     std::cout << std::unitbuf;
 
@@ -133,17 +137,19 @@ int main(int argc, char** argv) {
     const ResourceSnapshot process_start = resources();
     std::cout << "time_limit_seconds=" << time_limit << " branching_rule=" << branching_rule
               << " warm_start=" << (warm_start ? "on" : "off")
+              << " gmi_cuts=" << (gmi_cuts ? "on" : "off")
               << " gpu_available=" << (process_start.gpu_available ? "yes" : "no") << '\n';
     std::cout << std::left << std::setw(18) << "instance" << std::right << std::setw(12)
               << "status" << std::setw(18) << "ours" << std::setw(18) << "reference"
               << std::setw(12) << "abs_error" << std::setw(10) << "nodes" << std::setw(10)
               << "LPs" << std::setw(10) << "seconds" << std::setw(10) << "cpu_s"
               << std::setw(9) << "CPU%" << std::setw(12) << "RSS_MB" << std::setw(12)
-              << "GPU_MB" << std::setw(8) << "cuts" << std::setw(12) << "best_bound"
+              << "GPU_MB" << std::setw(8) << "cuts" << std::setw(8) << "gmi"
+              << std::setw(12) << "best_bound"
               << std::setw(10) << "gap" << std::setw(10) << "warm" << std::setw(10)
               << "warm_fb"
               << "  verdict\n";
-    std::cout << std::string(195, '-') << '\n';
+    std::cout << std::string(203, '-') << '\n';
 
     for (const fs::path& instance : instances) {
         const std::string name = instance.stem().string();
@@ -161,6 +167,7 @@ int main(int argc, char** argv) {
             options.time_limit_seconds = time_limit;
             options.use_rounding_heuristic = true;
             options.warm_start_node_relaxations = warm_start;
+            options.enable_root_gmi_cuts = gmi_cuts;
             if (branching_rule == "most") {
                 options.branching_rule = sihps::MilpBranchingRule::MOST_FRACTIONAL;
             } else if (branching_rule == "pseudocost") {
@@ -226,6 +233,7 @@ int main(int argc, char** argv) {
                       << std::setw(10) << cpu_seconds << std::setw(9) << cpu_utilization
                       << std::setw(12) << rss_mb << std::setw(12) << gpu_before_mb << " -> "
                       << std::setw(8) << gpu_after_mb << std::setw(8) << result.cover_cuts
+                      << std::setw(8) << result.root_gmi_cuts
                       << std::setw(12) << std::setprecision(8) << result.best_bound << " "
                       << std::setw(10) << result.relative_gap << std::setw(10)
                       << result.warm_started_relaxations << std::setw(10)

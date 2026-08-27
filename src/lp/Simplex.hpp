@@ -234,6 +234,38 @@ public:
     // drifted intermediate one).
     Basis export_basis() const;
 
+    // Tableau access for cutting-plane separation (Gomory mixed-integer
+    // cuts, docs/architecture/MILP.md \S2.2). Meaningful once solve() has
+    // returned OPTIMAL, under the same terminal-basis guarantee as
+    // export_basis() above. Column indices span [0, n_total()): structural
+    // columns first ([0, n_struct())), then slacks ([n_struct(),
+    // n_struct()+n_slack())), then phase-1 artificials.
+    std::int32_t n_total() const { return n_total_; }
+    std::int32_t n_struct() const { return n_struct_; }
+    std::int32_t n_slack() const { return n_slack_; }
+
+    // Row index (0..n_rows-1) in which `var` is currently basic, or -1 if
+    // `var` is nonbasic.
+    std::int32_t basic_row_of(std::int32_t var) const {
+        return basic_row_of_[static_cast<std::size_t>(var)];
+    }
+
+    // Which bound (if any) `var` currently rests at. BASIC entries are
+    // meaningless (the variable has no resting bound).
+    VarStatus status_of(std::int32_t var) const {
+        return status_[static_cast<std::size_t>(var)];
+    }
+
+    // Public wrapper around the private compute_tableau_row used
+    // internally for Devex pricing: rho[j] = (e_row^T B^-1) A_j for every
+    // augmented column j. `row` indexes basis rows, i.e. it is the value
+    // returned by basic_row_of for the row's basic variable.
+    std::vector<double> tableau_row(std::int32_t row) const {
+        std::vector<double> rho;
+        compute_tableau_row(row, rho);
+        return rho;
+    }
+
     explicit Simplex(const LpProblem& problem, PricingBackend backend = PricingBackend::CPU,
                       bool use_ruiz_scaling = true,
                       PricingRule pricing_rule = PricingRule::DEVEX,

@@ -64,7 +64,9 @@ current MIPLIB benchmark for exactly that reason (§4.1's certified-bound
 invariant is unaffected either way — the traded-away presolve reductions,
 not correctness, are what the measurement blames).
 
-## 2. Cuts (implemented root mixed-row cover subset)
+## 2. Cuts
+
+### 2.1 Root mixed-row cover cuts (implemented root mixed-row cover subset)
 
 The first cut implementation is deliberately narrow and auditable: root-only
 cover inequalities for rows with a finite upper activity bound and finite
@@ -90,6 +92,131 @@ public:
     // separation; binary-domain terms enter each cover inequality.
     // General MIR/flow-cover strengthening is intentionally not implied here.
     std::vector<Cut> separate(const LPResult& fractional_solution);
+};
+```
+
+### 2.2 Root Gomory mixed-integer (GMI) cuts
+
+`ESTABLISHED METHOD`: Gomory, "An algorithm for the mixed integer problem",
+RAND Corporation P-1885, 1960; closed-form coefficients per Wolsey,
+*Integer Programming*, 1998, Thm 5.1, and Marchand & Wolsey, "Aggregation
+and mixed integer rounding to solve MIPs", *Mathematical Programming*
+91(1), 2001, eq. (5)-(6). Cover cuts (§2.1) only separate binary-domain
+knapsack rows; the 5-instance MIPLIB benchmark (`bench_miplib`) contains
+three instances — `pk1`, `gen-ip002`, `gen-ip054` — that generate **zero**
+cover cuts for a structural reason, not a bug: `gen-ip*` have no binary
+variables at all, and `pk1`'s precedence-shaped rows never satisfy the
+cover condition. GMI cuts are separated from the final simplex **tableau**
+instead of row structure, so they apply to any row whose basic variable is
+integer-restricted and fractional, independent of row shape or variable
+domain — the complementary mechanism this gap needs.
+
+**Derivation.** For basis row $r$ with integer-restricted basic variable
+$x_{B[r]} = \beta_r$, $f_r = \beta_r - \lfloor\beta_r\rfloor \in (0,1)$, the
+exact tableau identity (a change of basis, valid on the whole affine
+subspace $\{Ax+s=\mathrm{rhs}\}$, not a local linearization)
+
+$$\beta_r - x_{B[r]} = \sum_{j \text{ nonbasic}} \bar\rho_{r,j}\, d_j$$
+
+($\bar\rho_{r,j} = \rho_{r,j}$ if $j$ rests at its lower bound, $-\rho_{r,j}$
+at its upper bound; $d_j \ge 0$ is the deviation from that resting bound)
+combines with $x_{B[r]}$ integer to give the standard MIR closed form:
+
+$$\sum_{j\in\mathbb{Z},\,f_j\le f_r} \tfrac{f_j}{f_r} d_j +
+  \sum_{j\in\mathbb{Z},\,f_j>f_r} \tfrac{1-f_j}{1-f_r} d_j +
+  \sum_{j\notin\mathbb{Z},\,\bar\rho_j\ge0} \tfrac{\bar\rho_j}{f_r} d_j +
+  \sum_{j\notin\mathbb{Z},\,\bar\rho_j<0} \tfrac{-\bar\rho_j}{1-f_r} d_j \;\ge\; 1$$
+
+Slacks are always routed through the continuous branch — a strict
+relaxation of the integer branch, so this is a safe strength trade, never
+a validity risk, and it avoids having to detect an incidentally-integer
+slack row. A nonbasic **free** variable (`VarStatus::AT_ZERO`) with a
+nonzero tableau coefficient has no one-sided $d_j\ge0$ bound to derive
+from, so the whole row is rejected (`RESEARCH note`: this is a documented
+scope limit of the classical construction, not an oversight). Nonbasic
+slacks are substituted back to structural variables via
+$s_i = \mathrm{rhs}_i - (Ax)_i$ before the cut is appended, since
+`LpProblem` rows carry only structural coefficients.
+
+`IMPLEMENTATION DECISION`: cut generation runs a **dedicated, separate,
+unscaled** `Simplex` solve on the root workspace (`use_ruiz_scaling =
+false`), rather than reusing `solve_lp`'s own result. Two reasons: (1)
+`solve_lp` runs presolve, and a tableau built in presolve's reduced
+column space would not be valid for `workspace`'s own row/column space,
+where the cut must be appended; (2) constructing the cut-generation
+solve unscaled means tableau coefficients and nonbasic bounds are
+directly in original model units, with no scale-factor bookkeeping in
+the cut derivation itself. Cost: one extra root-only LP solve, counted
+honestly in `lp_relaxations` rather than hidden.
+
+**Correctness verification.** Every accepted cut is checked for actual
+violation against the point it was derived from before being trusted
+(`cut_violation_tolerance`) — defense in depth against a derivation bug,
+not just a strength filter. Two hand-derived unit tests
+(`tests/milp/test_milp.cpp`) verify exact cut coefficients by direct
+substitution on tiny instances, one for each sign case (a nonbasic slack
+resting at its **lower** bound, and at its **upper** bound) — the upper-
+bound case exposed and fixed a real sign bug during development (the
+term contribution needs $d_j = (\mathrm{bound}_j - x_j)$, not
+$(x_j - \mathrm{bound}_j)$, for an upper-resting nonbasic variable; an
+earlier version used the same sign for both cases, which produced the
+*mirror-image, invalid* inequality — provably wrong on a hand-checked
+example — for every upper-resting term). Additionally, any accepted
+incumbent is independently re-verified against `problem.relaxation` (the
+**original**, uncut model) by `feasible_point`/`integral_point`
+(§4.1) regardless of what cuts were added to the internal `workspace` —
+so even an undetected cut-generation defect cannot fabricate a reported
+solution that violates the true model; at worst it can cause the search
+to miss the true optimum or fail numerically, both of which are exactly
+what was measured next.
+
+**`MEASURED`, KPI gate: not cleared. Default off.**
+`bench_miplib data/miplib2017_small … 60 reliability off {off,on}`,
+single process, 60 s budget per instance:
+
+| instance | GMI off (baseline) | GMI on |
+|---|---|---|
+| `gen-ip002` | TIME_LIMIT, gap 0.00417 | TIME_LIMIT, gap 0.00451 (worse) |
+| `gen-ip054` | TIME_LIMIT, gap 0.00900 | **NUMERICAL_FAILURE** |
+| `markshare2` | TIME_LIMIT, incumbent 231 | TIME_LIMIT, incumbent 570 (worse) |
+| `neos859080` | **INFEASIBLE, certified, 0.87 s** | TIME_LIMIT (regressed) |
+| `pk1` | TIME_LIMIT, incumbent 44 | TIME_LIMIT, incumbent 60 (worse) |
+| certified/exact | 1/5 | 0/5 |
+
+GMI cuts regress 3 of 5 instances (worse final gap/incumbent despite
+fewer or comparable nodes), regress `neos859080` from a certified proof
+to a timeout, and cause a `NUMERICAL_FAILURE` on `gen-ip054`.
+
+**Root cause of the `gen-ip054` failure, diagnosed (not left as an
+unexplained flake):** a temporary diagnostic pass logging every accepted
+cut's coefficient range found, among `gen-ip054`'s root cuts, one cut
+with `min|coeff| = 4.49e-16, max|coeff| = 3.71, ratio ≈ 8.3e15` — a
+coefficient that is algebraically zero (a floating-point-roundoff
+residual from the slack-substitution arithmetic, not a real term)
+surviving only because the code filters exact-zero coefficients and
+nothing else. A second root cut had coefficients of order $10^6$–$10^7$
+against a rest-of-problem scale of $O(1\text{-}600)$. Both are
+well-documented failure modes of tableau-derived cuts in the cutting-
+plane literature (Cornuéjols, "Valid inequalities for mixed integer
+linear programs", 4OR 6, 2008, notes cut density and coefficient-
+magnitude disparity as the standard practical hazards; real solvers
+apply coefficient cleanup and numerically-safe cut filtering, e.g.
+Achterberg's thesis on cut selection). `KNOWN LIMITATION`, with a
+concrete, scoped follow-up: neither a relative near-zero cleanup
+threshold nor a coefficient dynamic-range/magnitude rejection filter
+exists yet for this cut family. That is the next item under this
+section, not a rewrite of the derivation above (which the hand-verified
+unit tests, including the upper-bound sign case, certify independently
+of this numerical issue).
+
+```cpp
+// Cover cuts (§2.1): row-structure separation, binary knapsack rows only.
+// GMI cuts (this section): tableau separation, any fractional
+// integer-restricted basic variable. Complementary, not redundant.
+struct GeneralCut {
+    std::vector<std::pair<VarId, double>> terms; // original structural-variable space
+    double rhs;
+    char row_type; // 'G' (>=) for GMI cuts today; 'L' (<=) for cover cuts
 };
 ```
 

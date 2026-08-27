@@ -27,13 +27,43 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 128 / 128 | `ctest` |
+| unit tests | 132 / 132 | `ctest` (128 pre-existing + 4 GMI-cut hand-verified cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
 
 This meets the roadmap's stated target — *"Maintain or exceed current 92/93
 Netlib validation"* — by one instance.
+
+---
+
+## Environment fix that predates this revision's other work
+
+Before any of the work below, this session's build showed **106/128 unit
+tests failing** with `CUDA error: the provided PTX was compiled with an
+unsupported toolchain`, contradicting the 128/128 claimed above. Root
+cause: `CMAKE_CUDA_ARCHITECTURES` was populated by CMake's own CUDA-
+language auto-defaulting (triggered by `project(... LANGUAGES CXX CUDA)`)
+*before* this file's `if(NOT CMAKE_CUDA_ARCHITECTURES)` guard ever ran, so
+the guard was dead code; on this machine (CMake 4.2.3 + CUDA 13.3) that
+default picked `sm_75` (Turing) instead of the dev GPU's actual `sm_89`
+(Ada RTX 3050 Laptop), producing a fatbin the driver rejects at
+kernel-launch time rather than at compile time — which is why a stale
+`build/` directory carrying the wrong cached architecture went
+undetected for however long it existed. Fixed by moving the default
+above `project()`, the only point at which CMake will actually honor it.
+`MEASURED` after the fix: fatbin reports `sm_89`, 128/128 tests pass,
+90/90 Netlib-validated (of 93 feasible instances with a published
+reference — unaffected).
+
+Separately, an uncommitted (but already measured-against) fix to
+`src/io/MpsReader.cpp` was found in the working tree and verified rather
+than discarded: a fixed-column MPS parsing fallback for classic strict-
+format files (`dfl001`, `sierra`, `forplan`, `gfrd-pnc`, `blend`, …)
+whose row/column names contain embedded blanks, or whose RHS/RANGES/
+BOUNDS vector-name field is blank rather than absent — both illegal
+under free-format whitespace tokenization. This is what the 93/93 /
+90/90 figures above already depend on; it is now committed.
 
 ---
 
@@ -146,6 +176,26 @@ against 5 real MIPLIB 2017 instances (60 s budget each,
 budget (`markshare2`: 231 vs. true optimum 1; `pk1`: 44 vs. 11). This, not
 warm-starting or further cuts, is the benchmark gap that should govern what
 gets built next for MILP.
+
+**Root Gomory mixed-integer (GMI) cuts** (`docs/architecture/MILP.md`
+§2.2) were built directly against this gap — cover cuts only separate
+binary knapsack rows, and `pk1`/`gen-ip002`/`gen-ip054` generate zero
+cover cuts for a structural reason (no binary variables, or non-
+knapsack-shaped rows). GMI cuts separate from the tableau instead, so
+they apply regardless of row shape or variable domain. `IMPLEMENTED`,
+correctness `MEASURED` (two hand-derived unit tests verifying exact cut
+coefficients by direct substitution, one per sign case — the upper-
+bound-resting case caught and fixed a real sign bug during development).
+Benchmark KPI gate: **not cleared**. `MEASURED` on the same 5-instance
+set, single process, 60 s/instance: 3/5 instances get a *worse* final
+gap or incumbent, `neos859080` regresses from a certified proof (0.87 s)
+to a timeout, and `gen-ip054` hits `NUMERICAL_FAILURE`, root-caused to a
+floating-point-noise coefficient (`4.5e-16` next to `O(1)` terms) and
+unbounded cut coefficient magnitude — both well-documented cutting-plane
+numerical hazards with no cleanup implemented yet. `KNOWN LIMITATION`,
+default off (`MilpSolverOptions::enable_root_gmi_cuts = false`), exactly
+the same KPI-gate discipline already applied to warm-started node
+relaxations below. Full account in `docs/architecture/MILP.md` §2.2.
 
 `ENGINEERING DECISION` (historical): branch-and-bound was intentionally not
 built in this document's original pass because the benchmark set in question
@@ -286,27 +336,34 @@ was measured end to end (`docs/architecture/LP.md` §8) and did not clear the
 KPI gate, so it ships off by default; the B&B exists but is not yet
 benchmark-ready, which is now the top item below.
 
-1. **Close the MILP benchmark gap.** 1/5 certified and 3/5 badly wrong
-   incumbents on the 5-instance MIPLIB set within a 60 s budget
-   (`reports/runs/2026-08-25/miplib-raw.txt`) is the real open MILP item —
-   ahead of any further cuts, heuristics, or symmetry work, none of which
-   this measurement implicates *blindly*. Diagnosed (three independent
-   passes: instance-difficulty research, cover-cut correctness audit,
-   B&B bound-tracking audit — all in this repository's history, no fresh
-   citation needed here): `markshare2`'s badness is *expected* — it is
-   from Cornuéjols & Dawande's 1999 "hard small 0-1 programs" paper,
-   deliberately constructed to defeat conventional B&B; no cut or
-   branching fix reaches it without a Feasibility-Pump-class method or a
-   lattice/GCD reformulation. Cover-cut generation and B&B bound-tracking
-   were both audited line-by-line and are correct — no bug. `pk1`/
-   `gen-ip002`/`gen-ip054` are MIPLIB-rated "easy" yet perform badly for a
-   real, fixable reason: all three generate **zero** cover cuts (`gen-ip*`
-   have no binary variables at all — cover-cut separation only targets
-   binary-domain knapsack rows, by construction; `pk1`'s precedence-shaped
-   constraints don't trigger the cover condition either). Concrete next
-   candidates: Gomory/MIR cuts (apply to general-integer rows, unlike
-   cover cuts), and separating cuts at more than one round/node — cuts
-   currently fire once, at the root only, even when they do apply.
+1. **Close the MILP benchmark gap — still open.** 1/5 certified and 3/5
+   badly wrong incumbents on the 5-instance MIPLIB set within a 60 s
+   budget (`reports/runs/2026-08-25/miplib-raw.txt`) is the real open MILP
+   item — ahead of any further heuristics or symmetry work. Diagnosed
+   (three independent passes: instance-difficulty research, cover-cut
+   correctness audit, B&B bound-tracking audit — all in this repository's
+   history, no fresh citation needed here): `markshare2`'s badness is
+   *expected* — it is from Cornuéjols & Dawande's 1999 "hard small 0-1
+   programs" paper, deliberately constructed to defeat conventional B&B;
+   no cut or branching fix reaches it without a Feasibility-Pump-class
+   method or a lattice/GCD reformulation. Cover-cut generation and B&B
+   bound-tracking were both audited line-by-line and are correct — no bug.
+   `pk1`/`gen-ip002`/`gen-ip054` generate **zero** cover cuts (`gen-ip*`
+   have no binary variables at all; `pk1`'s precedence-shaped constraints
+   don't trigger the cover condition either) — root GMI cuts
+   (`docs/architecture/MILP.md` §2.2) were built directly against this,
+   are correct (hand-verified), but **did not clear the KPI gate**: 3/5
+   instances get worse, one regresses from certified to timeout, and one
+   hits `NUMERICAL_FAILURE` from unfiltered floating-point-noise and
+   large-magnitude cut coefficients. Concrete next candidate, now the top
+   MILP item: **numerical cleanup for GMI cuts** — a relative near-zero
+   coefficient threshold (not just exact-zero) and a coefficient dynamic-
+   range/magnitude rejection filter, both standard, established
+   engineering techniques in the cutting-plane literature (Cornuéjols
+   2008 on numerical practicalities) — then re-run the exact same
+   `bench_miplib` A/B before considering the default flipped. Separating
+   cuts at more than one round/node (currently root-only for both
+   families) remains a separate, later candidate.
 2. **Peak RSS / VRAM capture and repeated-run medians** — the two Phase 0 gaps
    that still let a regression hide.
 3. **Generated adversarial LPs + Compute Sanitizer** — Phase 1's real

@@ -49,6 +49,19 @@ struct MilpSolverOptions {
     std::uint32_t max_root_cover_cuts = 64;
     double cut_violation_tolerance = 1e-7;
 
+    // Gomory mixed-integer cuts (Gomory 1960; Wolsey, "Integer
+    // Programming", 1998, Ch.5; Marchand & Wolsey, "Aggregation and mixed
+    // integer rounding to solve MIPs", Math. Programming 91(1), 2001;
+    // docs/architecture/MILP.md \S2.2), separated once at the root from the
+    // final simplex tableau. Unlike cover cuts (binary knapsack rows
+    // only), GMI cuts apply to any row with a fractional integer-
+    // restricted basic variable, including general-integer variables and
+    // non-knapsack-shaped rows -- the two families are complementary, not
+    // redundant. Default false pending a KPI-gate benchmark on
+    // bench_miplib, mirroring warm_start_node_relaxations above.
+    bool enable_root_gmi_cuts = false;
+    std::uint32_t max_root_gmi_cuts = 64;
+
     // Warm-started dual simplex for node relaxations (docs/architecture/
     // LP.md \S1/\S2, MILP.md's stated prerequisite): a non-root node
     // solves its LP relaxation by seating its parent's terminal basis and
@@ -76,6 +89,7 @@ struct MilpSolution {
     std::uint64_t strong_branching_probes = 0;
     std::uint64_t root_cover_cuts = 0;
     std::uint64_t cover_cuts = 0;
+    std::uint64_t root_gmi_cuts = 0;
     std::uint64_t incumbent_updates = 0;
     std::uint64_t diving_heuristic_lp_relaxations = 0;
     std::uint64_t local_improvement_lp_relaxations = 0;

@@ -328,6 +328,208 @@ void append_cover_cuts(LpProblem& workspace, const std::vector<CoverCut>& cuts) 
     }
 }
 
+// A cut in ORIGINAL structural-variable space: sum_k coeff_k * x_k >= rhs
+// (row_type 'G') or <= rhs (row_type 'L').
+struct GeneralCut {
+    std::vector<std::pair<std::int32_t, double>> terms;
+    double rhs = 0.0;
+    char row_type = 'G';
+};
+
+void append_general_cuts(LpProblem& workspace, const std::vector<GeneralCut>& cuts) {
+    const std::int32_t old_rows = workspace.n_rows();
+    std::size_t new_nnz = 0;
+    for (const GeneralCut& cut : cuts) new_nnz += cut.terms.size();
+    std::vector<Triplet> entries;
+    entries.reserve(static_cast<std::size_t>(workspace.A.nnz()) + new_nnz);
+    for (std::int32_t i = 0; i < old_rows; ++i) {
+        for (std::int32_t k = workspace.A.row_ptr()[i]; k < workspace.A.row_ptr()[i + 1]; ++k) {
+            const auto kk = static_cast<std::size_t>(k);
+            entries.push_back({i, workspace.A.col_idx()[kk], workspace.A.values()[kk]});
+        }
+    }
+    for (std::size_t cut_index = 0; cut_index < cuts.size(); ++cut_index) {
+        const auto row = old_rows + static_cast<std::int32_t>(cut_index);
+        for (const auto& [variable, coefficient] : cuts[cut_index].terms) {
+            entries.push_back({row, variable, coefficient});
+        }
+    }
+    workspace.A = CSRMatrix::from_triplets(
+        old_rows + static_cast<std::int32_t>(cuts.size()), workspace.n_cols(), entries);
+    for (const GeneralCut& cut : cuts) {
+        workspace.rhs.push_back(cut.rhs);
+        workspace.row_types.push_back(cut.row_type);
+        if (cut.row_type == 'L') {
+            workspace.slack_lower.push_back(0.0);
+            workspace.slack_upper.push_back(kInfinityValue);
+        } else {
+            workspace.slack_lower.push_back(-kInfinityValue);
+            workspace.slack_upper.push_back(0.0);
+        }
+    }
+}
+
+// Gomory mixed-integer cuts (ESTABLISHED METHOD: Gomory, "An algorithm for
+// the mixed integer problem", RAND P-1885, 1960; closed-form coefficients
+// per Wolsey, "Integer Programming", 1998, Thm 5.1, and Marchand & Wolsey,
+// "Aggregation and mixed integer rounding to solve MIPs", Math.
+// Programming 91(1), 2001, eq. (5)-(6); docs/architecture/MILP.md \S2.2).
+//
+// For basis row r whose basic variable x_B[r] is integer-restricted with
+// fractional value beta_r = floor(beta_r) + f_r, the exact tableau
+// identity (valid on the whole affine subspace {Ax+s=rhs}, not only at
+// the current vertex -- it is a change of basis, not a linearization)
+// beta_r - x_B[r] = sum_{j nonbasic} bar_rho_{r,j} * d_j
+// (bar_rho_{r,j} = rho_{r,j} if j rests at its lower bound, -rho_{r,j} if
+// at its upper bound; d_j = |x_j - resting bound| >= 0 for every feasible
+// x) combines with x_B[r] integer to give a two-branch disjunction whose
+// MIR closed form is:
+//   sum_{j in Z, f_j<=f_r} (f_j/f_r) d_j + sum_{j in Z, f_j>f_r} ((1-f_j)/(1-f_r)) d_j
+// + sum_{j not in Z, bar_rho_j>=0} (bar_rho_j/f_r) d_j + sum_{j not in Z, bar_rho_j<0} (-bar_rho_j/(1-f_r)) d_j
+//   >= 1
+// where f_j = frac(bar_rho_{r,j}) for integer-restricted nonbasic j.
+// Slacks are always treated via the continuous branch (safe: it is a
+// strict relaxation of the integer branch, never invalid, only weaker --
+// no attempt is made here to detect an incidentally-integer slack row).
+// A nonbasic FREE variable (VarStatus::AT_ZERO) with a nonzero tableau
+// coefficient has no one-sided d_j >= 0 bound to derive from, so the
+// whole row is rejected rather than silently dropping that term (which
+// would not be a valid relaxation) -- a documented, deliberate scope
+// limit, not an oversight.
+//
+// The resulting inequality is over the tableau's own nonbasic columns
+// (structural AND slack); nonbasic slack terms are substituted back via
+// s_i = rhs_i - (Ax)_i to produce a cut purely in ORIGINAL structural
+// variables, the space append_general_cuts appends new rows into.
+std::vector<GeneralCut> separate_gmi_cuts(const MilpProblem& problem, const LpProblem& workspace,
+                                           const Simplex& simplex, const std::vector<double>& x,
+                                           double integrality_tolerance,
+                                           double violation_tolerance, std::uint32_t limit) {
+    std::vector<GeneralCut> cuts;
+    const std::int32_t n_struct = workspace.n_cols();
+    const std::int32_t n_slack = workspace.n_rows();
+
+    std::vector<double> struct_coeff(static_cast<std::size_t>(n_struct));
+
+    for (std::int32_t basic_col = 0; basic_col < n_struct && cuts.size() < limit; ++basic_col) {
+        const auto bj = static_cast<std::size_t>(basic_col);
+        if (problem.variable_types[bj] == VariableType::CONTINUOUS) continue;
+        const std::int32_t row = simplex.basic_row_of(basic_col);
+        if (row < 0) continue; // not basic in this tableau
+
+        const double beta = x[bj];
+        if (!std::isfinite(beta)) continue;
+        const double floor_beta = std::floor(beta);
+        const double f_r = beta - floor_beta;
+        if (f_r <= integrality_tolerance || 1.0 - f_r <= integrality_tolerance) continue;
+
+        const std::vector<double> rho = simplex.tableau_row(row);
+        std::fill(struct_coeff.begin(), struct_coeff.end(), 0.0);
+        double constant = 0.0;
+        bool reject_row = false;
+
+        for (std::int32_t j = 0; j < simplex.n_total() && !reject_row; ++j) {
+            if (j == basic_col) continue;
+            const double rho_j = rho[static_cast<std::size_t>(j)];
+            if (rho_j == 0.0) continue;
+            const Simplex::VarStatus status = simplex.status_of(j);
+            if (status == Simplex::VarStatus::BASIC) continue;
+            if (status == Simplex::VarStatus::AT_ZERO) {
+                // Free nonbasic variable, nonzero coefficient: no valid
+                // one-sided cut from this row (see function comment).
+                reject_row = true;
+                break;
+            }
+
+            const bool is_lower = (status == Simplex::VarStatus::AT_LOWER);
+            double bound_j;
+            if (j < n_struct) {
+                bound_j = is_lower ? workspace.lower[static_cast<std::size_t>(j)]
+                                    : workspace.upper[static_cast<std::size_t>(j)];
+            } else if (j < n_struct + n_slack) {
+                const auto row_i = static_cast<std::size_t>(j - n_struct);
+                bound_j = is_lower ? workspace.slack_lower[row_i] : workspace.slack_upper[row_i];
+            } else {
+                continue; // artificial: pinned to [0,0], contributes nothing
+            }
+            if (!std::isfinite(bound_j)) {
+                // A nonbasic variable resting at an infinite bound cannot
+                // occur at a genuine optimum; guard rather than propagate
+                // an Inf/NaN cut coefficient.
+                reject_row = true;
+                break;
+            }
+
+            const double bar_rho = is_lower ? rho_j : -rho_j;
+            const bool is_integer_col =
+                (j < n_struct) &&
+                problem.variable_types[static_cast<std::size_t>(j)] != VariableType::CONTINUOUS;
+            double coeff;
+            if (is_integer_col) {
+                const double fj = bar_rho - std::floor(bar_rho);
+                coeff = (fj <= f_r) ? (fj / f_r) : ((1.0 - fj) / (1.0 - f_r));
+            } else {
+                coeff = (bar_rho >= 0.0) ? (bar_rho / f_r) : (-bar_rho / (1.0 - f_r));
+            }
+            if (!std::isfinite(coeff) || coeff == 0.0) continue;
+
+            // The branch formula above yields the coefficient of d_j, the
+            // ALWAYS-NONNEGATIVE deviation from j's resting bound: d_j =
+            // (x_j - bound_j) when resting at the LOWER bound, but d_j =
+            // (bound_j - x_j) -- the OPPOSITE sign of (x_j - bound_j) --
+            // when resting at the UPPER bound. term_coeff below is
+            // coeff*d_j re-expressed as an affine function of x_j itself
+            // (term_coeff*x_j - term_coeff*bound_j), so it must carry that
+            // same sign flip; using coeff directly, unflipped, silently
+            // produces the mirror-image (invalid) inequality for every
+            // upper-resting nonbasic column.
+            const double term_coeff = is_lower ? coeff : -coeff;
+
+            if (j < n_struct) {
+                struct_coeff[static_cast<std::size_t>(j)] += term_coeff;
+                constant -= term_coeff * bound_j;
+            } else {
+                // Substitute s_i = rhs_i - (A x)_i for nonbasic slack i:
+                // term_coeff*(s_i - bound_i)
+                //   = term_coeff*rhs_i - term_coeff*bound_i - term_coeff*sum_k A_ik x_k.
+                const std::int32_t row_i = j - n_struct;
+                const auto row_ii = static_cast<std::size_t>(row_i);
+                constant += term_coeff * workspace.rhs[row_ii];
+                constant -= term_coeff * bound_j;
+                const std::int32_t begin = workspace.A.row_ptr()[row_i];
+                const std::int32_t end = workspace.A.row_ptr()[row_i + 1];
+                for (std::int32_t k = begin; k < end; ++k) {
+                    const auto kk = static_cast<std::size_t>(k);
+                    struct_coeff[static_cast<std::size_t>(workspace.A.col_idx()[kk])] -=
+                        term_coeff * workspace.A.values()[kk];
+                }
+            }
+        }
+        if (reject_row) continue;
+
+        const double cut_rhs = 1.0 - constant;
+        double lhs = 0.0;
+        for (std::int32_t k = 0; k < n_struct; ++k) {
+            const double c = struct_coeff[static_cast<std::size_t>(k)];
+            if (c != 0.0) lhs += c * x[static_cast<std::size_t>(k)];
+        }
+        // Defense in depth: an algebraically valid cut must be violated by
+        // the point it was derived from. Reject anything that is not,
+        // rather than trust the derivation blindly.
+        if (!(lhs < cut_rhs - violation_tolerance)) continue;
+
+        GeneralCut cut;
+        cut.row_type = 'G';
+        cut.rhs = cut_rhs;
+        for (std::int32_t k = 0; k < n_struct; ++k) {
+            const double c = struct_coeff[static_cast<std::size_t>(k)];
+            if (c != 0.0) cut.terms.push_back({k, c});
+        }
+        if (!cut.terms.empty()) cuts.push_back(std::move(cut));
+    }
+    return cuts;
+}
+
 std::vector<FractionalCandidate> fractional_candidates(const MilpProblem& problem,
                                                         const std::vector<double>& x,
                                                         double integrality_tolerance) {
@@ -420,6 +622,7 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
     std::vector<double> incumbent_x;
     bool relaxation_unbounded = false;
     bool root_cuts_separated = false;
+    bool root_gmi_separated = false;
 
     // Warm-started dual simplex for node relaxations
     // (docs/architecture/LP.md \S1/\S2). Keyed by SearchNode::order,
@@ -764,6 +967,37 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
                 solution.cover_cuts = cuts.size();
                 open.push(node);
                 continue;
+            }
+        }
+        if (node->depth == 0 && !root_gmi_separated && options.enable_root_gmi_cuts) {
+            root_gmi_separated = true;
+            // A dedicated unscaled solve, bypassing solve_lp's presolve:
+            // Gomory cuts need the tableau (B^-1), which solve_lp does not
+            // expose (its LpSolution carries only status/x/objective), and
+            // presolve's column-space reductions would make a tableau
+            // built there invalid for THIS workspace's own row/column
+            // space. Unscaled so tableau coefficients and nonbasic bounds
+            // are directly in original model units, with no scale-factor
+            // bookkeeping in the cut derivation itself. Root-only, so the
+            // extra LP solve is a bounded, one-time cost, counted honestly
+            // below rather than hidden from lp_relaxations.
+            Simplex gmi_simplex(workspace, PricingBackend::CPU, /*use_ruiz_scaling=*/false,
+                                relaxation_options.pricing_rule, LpAlgorithm::AUTO,
+                                relaxation_options.parallel_mode);
+            ++solution.lp_relaxations;
+            const LpResult gmi_lp = gmi_simplex.solve();
+            if (gmi_lp.status == LpStatus::OPTIMAL &&
+                gmi_lp.x.size() == static_cast<std::size_t>(problem.n_cols())) {
+                const auto cuts =
+                    separate_gmi_cuts(problem, workspace, gmi_simplex, gmi_lp.x,
+                                      options.integrality_tolerance,
+                                      options.cut_violation_tolerance, options.max_root_gmi_cuts);
+                if (!cuts.empty()) {
+                    append_general_cuts(workspace, cuts);
+                    solution.root_gmi_cuts = cuts.size();
+                    open.push(node);
+                    continue;
+                }
             }
         }
         if (std::isfinite(incumbent) &&
