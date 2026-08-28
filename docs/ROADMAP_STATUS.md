@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 155 / 155 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding cases + 3 RENS wiring/non-corruption cases) |
+| unit tests | 161 / 161 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding + 3 RENS wiring/non-corruption + 6 doubleton-substitution cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -230,7 +230,7 @@ objective-row RHS.
 | **Warm-started dual simplex** (`Simplex::set_warm_start_basis`/`export_basis`) | `IMPLEMENTED`, `MEASURED` — see below |
 | Hyper-sparse **BTRAN** with active-pattern detection | `IMPLEMENTED`, `MEASURED` — see below; FTRAN's `ftran_column` deferred |
 | Markowitz / AMD ordering, symbolic reuse | `ATTEMPTED`, `MEASURED`, **REVERTED** — see item 5 below and `docs/architecture/LP.md` §9 |
-| Presolve expansion (doubleton, aggregation, probing, …) | **NOT IMPLEMENTED** — LP-level; distinct from the MIP-specific row below |
+| Presolve expansion: doubleton substitution | `ATTEMPTED`, `MEASURED`, correct, **default off** — see item 9 below; general aggregation/probing still **NOT IMPLEMENTED** |
 | MIP-specific presolve: integer bound rounding (`src/lp/Presolve.cpp`'s opt-in `integer_columns`, `MilpSolverOptions::enable_integer_bound_rounding`) | `IMPLEMENTED`, `MEASURED`, default on — see item 8 below and `docs/architecture/MILP.md` §1.4a |
 
 `MEASURED` (`docs/architecture/LP.md` §9): `BasisFactorization::btran` now
@@ -587,12 +587,33 @@ benchmark-ready, which is now the top item below.
    **Now the top item**: coefficient tightening / GCD-based reductions
    (`markshare2`'s integer-valued matrix coefficients), still unattempted
    and not gated by `factorize()`'s hot path.
-9. Presolve expansion (doubleton, aggregation) for plain LP (Phase 2 table
-   above) — confirmed genuinely unimplemented, benefits both LP and every
-   MILP node relaxation, doesn't touch `factorize()`'s hot path directly
-   though `pilot87`'s now-proven sensitivity to *any* solve-path
-   perturbation argues for a precautionary `validate_netlib` sweep
-   regardless.
+9. ~~Presolve expansion: doubleton substitution~~ — **done, MEASURED,
+   honest null result, ships off by default.** Scoped to equality rows
+   where the eliminated variable appears in no other active row (avoids
+   the invasive matrix-mutation/fill-in architecture the general case
+   would need). Two real bugs found and fixed before this cleared testing:
+   (a) the eliminated variable's objective coefficient was never folded
+   into the survivor's, so the reduced LP silently optimized a different
+   objective than the true one — caught on Netlib `kb2` (reported
+   `OPTIMAL` at objective 0.0 against a true optimum of -1749.9, in 0
+   simplex iterations); (b) the outward relaxation on the implied bound,
+   carried through the affine reconstruction, could push the eliminated
+   variable's postsolved value up to ~1.4e-6 outside its own true bound on
+   large-magnitude models — caught on `greenbea`/`greenbeb`, fixed by
+   clamping at reconstruction time plus a derived, principled magnitude
+   guard (given `kBoundRelax`/`kFinalPrimalTol` are both fixed,
+   project-wide constants). `validate_netlib` 90/90 on two independent
+   full sweeps post-fix, `pilot87` bit-identical at 14,071 iterations both
+   times. **MEASURED aggregate LP wall-clock and MILP node counts show no
+   real difference, in either direction, once run-to-run noise (a ~10%
+   band regardless of config) is accounted for** — multiple paired on/off
+   `validate_netlib` runs and a 5-instance `bench_miplib` comparison both
+   landed within noise. An honest null result, not a bug: the reduction is
+   correct and well-tested (161 unit tests total) but doesn't move this
+   project's own benchmark sets, so it ships off by default, matching the
+   RENS and GMI-cuts precedents. General aggregation/probing (the
+   fill-in-capable case) remains unimplemented and is not currently the
+   top item given this result.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

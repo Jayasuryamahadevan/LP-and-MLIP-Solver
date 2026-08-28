@@ -345,3 +345,274 @@ SIHPS_TEST(presolve_integer_rounding_cascades_into_a_later_propagated_bound) {
     SIHPS_ASSERT_TRUE(found_x);
     SIHPS_ASSERT_TRUE(found_y);
 }
+
+// --- doubleton row substitution (opt-in via `enable_doubleton_
+// substitution`; SCOPED to equality rows where the eliminated variable
+// appears in NO other active row -- see Presolve.hpp) ------------------
+
+// Clean elimination + implied bound + postsolve round-trip. x + 2y = 10
+// (x isolated -- appears nowhere else), y + z <= 20. Hand-derived: x is
+// eliminated (only isolated candidate), intercept = 10/1 = 10,
+// slope = -2/1 = -2. x's own bounds [0, inf) imply, via slope < 0,
+// y <= (0 - 10)/(-2) = 5 -- row1 (y + z <= 20) is untouched, since x never
+// appears there (Increment 1's own scope boundary: no other row's
+// coefficients ever change).
+SIHPS_TEST(presolve_doubleton_eliminates_isolated_variable_and_tightens_the_survivor) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1.0}, {0, 1, 2.0}, // row0 (E): x + 2y = 10
+        {1, 1, 1.0}, {1, 2, 1.0}, // row1 (L): y + z <= 20
+    };
+    p.A = CSRMatrix::from_triplets(2, 3, t);
+    p.obj = {0.0, 0.0, 0.0};
+    p.rhs = {10.0, 20.0};
+    p.row_types = {'E', 'L'};
+    p.lower = {0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    auto r = presolve(p, 20, {}, /*enable_doubleton_substitution=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+    SIHPS_ASSERT_TRUE(r.column_removed[0] == 1);
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[0] == 1);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.doubleton_eliminations.size()), 1);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[0].eliminated_col, 0);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[0].target_col, 1);
+    SIHPS_ASSERT_NEAR(r.doubleton_eliminations[0].intercept, 10.0, 1e-9);
+    SIHPS_ASSERT_NEAR(r.doubleton_eliminations[0].slope, -2.0, 1e-9);
+
+    bool found_y = false, found_z = false;
+    for (std::size_t k = 0; k < r.kept_columns.size(); ++k) {
+        if (r.kept_columns[k] == 1) {
+            SIHPS_ASSERT_TRUE(r.reduced.upper[k] <= 5.0 + 1e-6);
+            found_y = true;
+        } else if (r.kept_columns[k] == 2) {
+            found_z = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found_y);
+    SIHPS_ASSERT_TRUE(found_z);
+    // row1 must survive untouched (only x's isolation makes this safe;
+    // x never appears in row1, so row1's own coefficients are unaffected).
+    SIHPS_ASSERT_TRUE(r.removed_rows() == 1);
+
+    std::vector<double> reduced_x(r.kept_columns.size());
+    for (std::size_t k = 0; k < r.kept_columns.size(); ++k) {
+        if (r.kept_columns[k] == 1) reduced_x[k] = 3.0; // y = 3
+        else if (r.kept_columns[k] == 2) reduced_x[k] = 1.0; // z = 1
+    }
+    auto full = sihps::postsolve(r, reduced_x);
+    SIHPS_ASSERT_NEAR(full[0], 4.0, 1e-9); // x = 10 - 2*3 = 4
+    SIHPS_ASSERT_NEAR(full[1], 3.0, 1e-9);
+}
+
+// Numerical-safety guard: a near-zero coefficient on the isolated variable
+// must decline the elimination entirely (row and column both left
+// untouched), not substitute through a poorly-conditioned pivot.
+SIHPS_TEST(presolve_doubleton_declines_a_near_zero_pivot) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1e-13}, {0, 1, 1.0}, // row0 (E): 1e-13*x + y = 5
+        {1, 1, 1.0}, {1, 2, 1.0},   // row1 (L): y + z <= 20
+    };
+    p.A = CSRMatrix::from_triplets(2, 3, t);
+    p.obj = {0.0, 0.0, 0.0};
+    p.rhs = {5.0, 20.0};
+    p.row_types = {'E', 'L'};
+    p.lower = {0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    auto r = presolve(p, 20, {}, /*enable_doubleton_substitution=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+    SIHPS_ASSERT_TRUE(r.column_removed[0] == 0); // x untouched
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[0] == 0);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.doubleton_eliminations.size()), 0);
+    bool row0_kept = false;
+    for (std::int32_t row : r.kept_rows) {
+        if (row == 0) row0_kept = true;
+    }
+    SIHPS_ASSERT_TRUE(row0_kept);
+}
+
+// Interaction with an existing reduction two passes later, purely through
+// shared col_lo/col_hi state, with no bespoke wiring between the two
+// reductions: row0's doubleton tightens y's upper to 5 in pass 1; row2's
+// EXISTING (unmodified) singleton-row absorption tightens y's lower to 5
+// in the SAME pass; pass 2's EXISTING (unmodified) fixed-column check then
+// fixes y = 5 via ordinary substitution (not a doubleton), which in turn
+// reduces row1 to a singleton on z (upper -> 15, absorbed), and THAT in
+// turn empties z's last active row -- z is then fixed at 0 by the
+// EXISTING (unmodified) empty-column reduction (cost 0 -> lower bound).
+// The whole point of this fixture: verify the doubleton triggers this
+// entire pre-existing cascade correctly, not just its own immediate
+// effect.
+SIHPS_TEST(presolve_doubleton_enables_a_later_ordinary_fixed_column_reduction) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1.0}, {0, 1, 2.0}, // row0 (E): x + 2y = 10
+        {1, 1, 1.0}, {1, 2, 1.0}, // row1 (L): y + z <= 20
+        {2, 1, 1.0},              // row2 (G): y >= 5
+    };
+    p.A = CSRMatrix::from_triplets(3, 3, t);
+    p.obj = {0.0, 0.0, 0.0};
+    p.rhs = {10.0, 20.0, 5.0};
+    p.row_types = {'E', 'L', 'G'};
+    p.lower = {0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    auto r = presolve(p, 20, {}, /*enable_doubleton_substitution=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    SIHPS_ASSERT_TRUE(r.column_removed[0] == 1); // x: doubleton
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[0] == 1);
+    SIHPS_ASSERT_TRUE(r.column_removed[1] == 1); // y: ordinary fix
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[1] == 0);
+    SIHPS_ASSERT_NEAR(r.fixed_value[1], 5.0, 1e-6);
+    SIHPS_ASSERT_TRUE(r.column_removed[2] == 1); // z: cascades to empty-column fix
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[2] == 0);
+    SIHPS_ASSERT_NEAR(r.fixed_value[2], 0.0, 1e-6);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.kept_columns.size()), 0);
+
+    // Postsolve must still recover the full, mutually consistent point:
+    // x=0, y=5, z=0 satisfies every ORIGINAL equation directly.
+    auto full = sihps::postsolve(r, {});
+    SIHPS_ASSERT_NEAR(full[0], 0.0, 1e-6);
+    SIHPS_ASSERT_NEAR(full[1], 5.0, 1e-6);
+    SIHPS_ASSERT_NEAR(full[2], 0.0, 1e-6);
+    SIHPS_ASSERT_NEAR(full[0] + 2.0 * full[1], 10.0, 1e-6);
+    SIHPS_ASSERT_TRUE(full[1] + full[2] <= 20.0 + 1e-6);
+    SIHPS_ASSERT_TRUE(full[1] >= 5.0 - 1e-6);
+}
+
+// Chained doubletons: eliminating x (via row0) drops row0, which lowers
+// y's active-row count to 1 -- making y itself doubleton-eligible in
+// row1, in the SAME pass. x + y = 10 (x isolated) eliminates x
+// (intercept=10, slope=-1); 2y + z = 4 then eliminates y in favor of z
+// (intercept=2, slope=-0.5) -- z, unlike y, is NOT isolated (it also
+// appears in row2, a loose z + w <= 100 that keeps both z and w alive as
+// genuinely free surviving columns, so this fixture actually exercises
+// postsolve reconstructing a chain, rather than everything cascading to
+// fixed constants the way the fixture above deliberately does). This is
+// the direct proof that reverse-order replay in postsolve resolves the
+// dependency chain correctly: y's value must be known before x's can be
+// computed, and y's own recorded elimination depends on z.
+SIHPS_TEST(presolve_doubleton_chains_through_postsolve_in_the_correct_order) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1.0}, {0, 1, 1.0}, // row0 (E): x + y = 10
+        {1, 1, 2.0}, {1, 2, 1.0}, // row1 (E): 2y + z = 4
+        {2, 2, 1.0}, {2, 3, 1.0}, // row2 (L): z + w <= 100
+    };
+    p.A = CSRMatrix::from_triplets(3, 4, t);
+    p.obj = {0.0, 0.0, 0.0, 0.0};
+    p.rhs = {10.0, 4.0, 100.0};
+    p.row_types = {'E', 'E', 'L'};
+    p.lower = {0.0, 0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    auto r = presolve(p, 20, {}, /*enable_doubleton_substitution=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+    SIHPS_ASSERT_TRUE(r.column_removed[0] == 1); // x
+    SIHPS_ASSERT_TRUE(r.column_removed[1] == 1); // y
+    SIHPS_ASSERT_TRUE(r.column_removed[2] == 0); // z survives
+    SIHPS_ASSERT_TRUE(r.column_removed[3] == 0); // w survives
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[0] == 1);
+    SIHPS_ASSERT_TRUE(r.column_is_doubleton[1] == 1);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.doubleton_eliminations.size()), 2);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[0].eliminated_col, 0);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[0].target_col, 1);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[1].eliminated_col, 1);
+    SIHPS_ASSERT_EQ(r.doubleton_eliminations[1].target_col, 2);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.kept_columns.size()), 2);
+
+    std::vector<double> reduced_x(r.kept_columns.size());
+    for (std::size_t k = 0; k < r.kept_columns.size(); ++k) {
+        if (r.kept_columns[k] == 2) reduced_x[k] = 2.0; // z = 2
+        else if (r.kept_columns[k] == 3) reduced_x[k] = 5.0; // w = 5 (unused by the chain)
+    }
+    auto full = sihps::postsolve(r, reduced_x);
+    SIHPS_ASSERT_NEAR(full[2], 2.0, 1e-9); // z
+    SIHPS_ASSERT_NEAR(full[1], 1.0, 1e-9); // y = 2 + (-0.5)*2 = 1
+    SIHPS_ASSERT_NEAR(full[0], 9.0, 1e-9); // x = 10 + (-1)*1 = 9
+    // Cross-check directly against the ORIGINAL equations, independent of
+    // the postsolve formula itself.
+    SIHPS_ASSERT_NEAR(full[0] + full[1], 10.0, 1e-9);
+    SIHPS_ASSERT_NEAR(2.0 * full[1] + full[2], 4.0, 1e-9);
+}
+
+// Backward compatibility: the default call signature (no
+// `enable_doubleton_substitution` argument at all) must leave a fixture
+// that WOULD be eliminated if flagged completely untouched.
+SIHPS_TEST(presolve_doubleton_substitution_is_off_by_default) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1.0}, {0, 1, 2.0}, // row0 (E): x + 2y = 10
+        {1, 1, 1.0}, {1, 2, 1.0}, // row1 (L): y + z <= 20
+    };
+    p.A = CSRMatrix::from_triplets(2, 3, t);
+    p.obj = {0.0, 0.0, 0.0};
+    p.rhs = {10.0, 20.0};
+    p.row_types = {'E', 'L'};
+    p.lower = {0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    auto r = presolve(p); // no enable_doubleton_substitution argument
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+    SIHPS_ASSERT_TRUE(r.column_removed[0] == 0);
+    SIHPS_ASSERT_EQ(static_cast<int>(r.doubleton_eliminations.size()), 0);
+}
+
+// A real bug caught on Netlib `kb2` before this shipped, pinned down here
+// so it can never silently regress: every hand-derived fixture above uses
+// an all-zero objective, which never exercises objective-coefficient
+// redistribution at all. When x_e = intercept + slope*x_s is substituted,
+// x_e's cost contributes c_e*slope*x_s to the TRUE objective -- if that is
+// not folded into x_s's own coefficient in the REDUCED problem, the
+// simplex silently optimizes a DIFFERENT objective while still returning
+// an apparently-valid feasible point. On `kb2` this produced a reduced
+// problem whose trivial all-zero starting point looked optimal in 0
+// iterations, `OPTIMAL` status, objective 0.0 against a true optimum of
+// -1749.9 -- exactly the "confidently wrong, not obviously broken"
+// failure this project's own verification gates exist to catch, caught
+// here directly by the `validate_netlib` sweep this reduction's own
+// KPI-gate measurement required.
+//
+// x + 2y = 10 (x isolated), y + z <= 20, minimize x - y. Hand-derived:
+// x = 10 - 2y, so the true objective is (10-2y) - y = 10 - 3y, minimized
+// by taking y to its largest feasible value. y's own implied bound from
+// x >= 0 is y <= 5 (same derivation as the fixture above); z is free at
+// zero cost, so any z in [0, 20-y] is equally optimal. True optimum:
+// x=0, y=5, objective=-5, independent of z.
+SIHPS_TEST(presolve_doubleton_redistributes_the_eliminated_variables_objective_coefficient) {
+    LpProblem p;
+    std::vector<Triplet> t = {
+        {0, 0, 1.0}, {0, 1, 2.0}, // row0 (E): x + 2y = 10
+        {1, 1, 1.0}, {1, 2, 1.0}, // row1 (L): y + z <= 20
+    };
+    p.A = CSRMatrix::from_triplets(2, 3, t);
+    p.obj = {1.0, -1.0, 0.0}; // minimize x - y
+    p.rhs = {10.0, 20.0};
+    p.row_types = {'E', 'L'};
+    p.lower = {0.0, 0.0, 0.0};
+    p.upper = {kInfinity, kInfinity, kInfinity};
+    sihps::apply_default_row_bounds(p);
+
+    LpSolverOptions without;
+    without.enable_doubleton_substitution = false;
+    const auto baseline = solve_lp(p, without);
+
+    LpSolverOptions with;
+    with.enable_doubleton_substitution = true;
+    const auto reduced = solve_lp(p, with);
+
+    SIHPS_ASSERT_TRUE(baseline.status == LpStatus::OPTIMAL);
+    SIHPS_ASSERT_TRUE(reduced.status == LpStatus::OPTIMAL);
+    SIHPS_ASSERT_NEAR(baseline.objective_value, -5.0, 1e-6);
+    SIHPS_ASSERT_NEAR(reduced.objective_value, -5.0, 1e-6);
+    SIHPS_ASSERT_NEAR(reduced.x[0], 0.0, 1e-6);
+    SIHPS_ASSERT_NEAR(reduced.x[1], 5.0, 1e-6);
+}

@@ -47,6 +47,41 @@ constexpr double kBoundRelax = 1e-9;
 // |u - l| below this treats a column as fixed.
 constexpr double kFixTol = 1e-11;
 
+// Doubleton substitution divides by the eliminated variable's own row
+// coefficient (both intercept and slope carry 1/a_e). A tiny a_e amplifies
+// any noise in the row's midpoint / the surviving variable's coefficient
+// into the substitution -- and unlike a bound derivation that affects one
+// column reversibly (the simplex can still re-derive a tighter bound
+// later), a doubleton elimination reads permanently into
+// column_is_doubleton/postsolve with no further chance to re-verify it.
+// Gated more conservatively than tighten_lower/upper's own derived-limit
+// checks for exactly that reason.
+constexpr double kDoubletonPivotFloor = 1e-9;      // absolute floor on |a_e|
+constexpr double kDoubletonRelativeFloor = 1e-8;   // |a_e| >= this * |a_s|
+
+// A SEPARATE numerical guard from the pivot floor above, for a different
+// failure mode -- MEASURED, not theoretical, on Netlib `greenbea`/
+// `greenbeb`. postsolve() clamps the reconstructed x[eliminated_col]
+// exactly into its own recorded bounds (see DoubletonElimination's own
+// comment), which is correct and necessary -- but that clamp can leave the
+// DROPPED row's own equation violated by up to roughly
+// kBoundRelax*(1+|eliminated_col's bound magnitude|), because
+// tighten_lower/upper's own outward relaxation on the IMPLIED bound placed
+// on the surviving variable carries straight through the affine
+// reconstruction with no compensating slack. On a model whose row RHS
+// values are small (so original_space_primal_residual's
+// `/(1+rhs_norm)` scaling offers little protection -- exactly greenbea's
+// case) that leak can exceed the project's fixed final-verification gate
+// (kFinalPrimalTol, LpSolver.cpp) even though it is minuscule in relative
+// terms. kBoundRelax and kFinalPrimalTol are both fixed, shared project
+// constants (used far beyond this one reduction) that this file should
+// not weaken just to make doubleton fire more often -- so the bound is
+// enforced the other way: decline elimination outright when the
+// eliminated column's own bound magnitude is large enough that the worst-
+// case leak could plausibly threaten the gate, with a real safety margin
+// rather than cutting it exactly at the line.
+constexpr double kDoubletonMaxEliminatedBoundMagnitude = 99.0;
+
 // Per-row min/max activity of A x, tracking infinite contributions
 // separately so that bound propagation stays valid when a variable is
 // unbounded: with exactly one infinite contributor, the row still bounds
@@ -68,7 +103,8 @@ struct Activity {
 } // namespace
 
 PresolveResult presolve(const LpProblem& problem, int max_passes,
-                         const std::vector<char>& integer_columns) {
+                         const std::vector<char>& integer_columns,
+                         bool enable_doubleton_substitution) {
     PresolveResult result;
     const std::int32_t m = problem.n_rows();
     const std::int32_t n = problem.n_cols();
@@ -101,6 +137,24 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
     std::vector<double> col_lo = problem.lower;
     std::vector<double> col_hi = problem.upper;
 
+    // A doubleton elimination x_e = intercept + slope*x_s changes what the
+    // SURVIVING column's own cost coefficient must be for the REDUCED
+    // problem's simplex to optimize the same true objective: the eliminated
+    // term c_e*x_e contributes c_e*intercept (a constant, dropped -- the
+    // final objective_value is recomputed from the full reconstructed x in
+    // LpSolver.cpp regardless) PLUS c_e*slope*x_s, which must be ADDED onto
+    // x_s's own coefficient, or the simplex silently optimizes a DIFFERENT
+    // objective than the true one while still returning a feasible point --
+    // exactly the failure mode this comment exists to prevent a future
+    // editor from reintroducing. Read (empty-column's cost sign) and
+    // written (doubleton elimination) from here on instead of
+    // `problem.obj` directly, so a chain of eliminations (see
+    // tests/lp/test_presolve.cpp's chained-doubleton fixture) accumulates
+    // correctly: each elimination uses the ELIMINATED column's CURRENT
+    // (possibly already-corrected, if it was itself an earlier
+    // elimination's target) coefficient, not its original one.
+    std::vector<double> working_obj = problem.obj;
+
     // Round the ORIGINAL bounds of any integer-restricted column inward
     // before the pass loop even starts, covering a fractional bound given
     // directly in the model (the common case -- a bound derived later by
@@ -118,6 +172,7 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
 
     result.fixed_value.assign(static_cast<std::size_t>(n), 0.0);
     result.column_removed.assign(static_cast<std::size_t>(n), 0);
+    result.column_is_doubleton.assign(static_cast<std::size_t>(n), 0);
 
     std::vector<std::int32_t> row_count(static_cast<std::size_t>(m), 0);
     std::vector<std::int32_t> col_count(static_cast<std::size_t>(n), 0);
@@ -305,7 +360,7 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
         for (std::int32_t j = 0; j < n && !unbounded; ++j) {
             const auto jj = static_cast<std::size_t>(j);
             if (!col_active[jj] || col_count[jj] != 0) continue;
-            const double c = problem.obj[jj];
+            const double c = working_obj[jj];
             if (c > 0.0) {
                 if (!std::isfinite(col_lo[jj])) {
                     unbounded = true;
@@ -458,6 +513,143 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
                 changed = true;
                 continue;
             }
+
+            // --- Doubleton row substitution (SCOPED, see Presolve.hpp's
+            // own comment on `enable_doubleton_substitution`): an EQUALITY
+            // row with exactly two active nonzero coefficients, where one
+            // of the two variables appears in NO other active row, is
+            // eliminated by expressing it as an exact affine function of
+            // the other. Only the isolated-variable case is handled here;
+            // if NEITHER variable is isolated, eliminating either would
+            // require mutating some OTHER row's coefficients, which this
+            // file does not support (see Presolve.hpp) -- the row is left
+            // untouched in that case, a deliberate scope boundary, not a
+            // missed case.
+            if (enable_doubleton_substitution && row_count[ii] == 2 &&
+                row_hi[ii] - row_lo[ii] <= kFixTol) {
+                std::int32_t p = -1, q = -1;
+                double a_p = 0.0, a_q = 0.0;
+                for (std::int32_t k = A.row_ptr()[i]; k < A.row_ptr()[i + 1]; ++k) {
+                    const std::int32_t candidate = A.col_idx()[k];
+                    if (A.values()[k] == 0.0) continue;
+                    if (!col_active[static_cast<std::size_t>(candidate)]) continue;
+                    if (p < 0) {
+                        p = candidate;
+                        a_p = A.values()[k];
+                    } else {
+                        q = candidate;
+                        a_q = A.values()[k];
+                        break;
+                    }
+                }
+
+                if (p >= 0 && q >= 0) {
+                    const auto pp = static_cast<std::size_t>(p);
+                    const auto qq = static_cast<std::size_t>(q);
+                    const bool p_isolated = col_count[pp] == 1;
+                    const bool q_isolated = col_count[qq] == 1;
+
+                    std::int32_t e = -1, s = -1;
+                    double a_e = 0.0, a_s = 0.0;
+                    if (p_isolated && q_isolated) {
+                        // Both isolated: eliminate the larger-magnitude
+                        // coefficient for a better-conditioned 1/a_e.
+                        if (std::fabs(a_p) >= std::fabs(a_q)) {
+                            e = p; a_e = a_p; s = q; a_s = a_q;
+                        } else {
+                            e = q; a_e = a_q; s = p; a_s = a_p;
+                        }
+                    } else if (p_isolated) {
+                        e = p; a_e = a_p; s = q; a_s = a_q;
+                    } else if (q_isolated) {
+                        e = q; a_e = a_q; s = p; a_s = a_p;
+                    }
+                    // else: neither isolated -- deferred, see comment above.
+
+                    // Only FINITE bounds contribute to the leak this guards
+                    // against -- an infinite bound is skipped entirely by
+                    // both the implied-bound derivation below (isfinite-
+                    // gated) and by postsolve's clamp (a no-op against
+                    // infinity), so it carries no risk regardless of being
+                    // "infinitely large" in a literal sense.
+                    const bool bound_magnitude_safe = [&]() {
+                        if (e < 0) return false;
+                        const auto ee2 = static_cast<std::size_t>(e);
+                        double worst_finite_bound = 0.0;
+                        if (std::isfinite(col_lo[ee2])) {
+                            worst_finite_bound = std::max(worst_finite_bound, std::fabs(col_lo[ee2]));
+                        }
+                        if (std::isfinite(col_hi[ee2])) {
+                            worst_finite_bound = std::max(worst_finite_bound, std::fabs(col_hi[ee2]));
+                        }
+                        return worst_finite_bound <= kDoubletonMaxEliminatedBoundMagnitude;
+                    }();
+
+                    if (e >= 0 && bound_magnitude_safe &&
+                        std::fabs(a_e) >= kDoubletonPivotFloor &&
+                        std::fabs(a_e) >= kDoubletonRelativeFloor * std::fabs(a_s)) {
+                        const auto ee = static_cast<std::size_t>(e);
+                        const auto ss = static_cast<std::size_t>(s);
+                        const double c = 0.5 * (row_lo[ii] + row_hi[ii]);
+                        const double intercept = c / a_e;
+                        const double slope = -a_s / a_e;
+
+                        // Implied bound on x_s from x_e's OWN current
+                        // bounds: x_e = intercept + slope*x_s must stay
+                        // within [col_lo[e], col_hi[e]].
+                        double implied_s_lo = -kInfinity;
+                        double implied_s_hi = kInfinity;
+                        if (slope > 0.0) {
+                            if (std::isfinite(col_lo[ee])) implied_s_lo = (col_lo[ee] - intercept) / slope;
+                            if (std::isfinite(col_hi[ee])) implied_s_hi = (col_hi[ee] - intercept) / slope;
+                        } else {
+                            if (std::isfinite(col_hi[ee])) implied_s_lo = (col_hi[ee] - intercept) / slope;
+                            if (std::isfinite(col_lo[ee])) implied_s_hi = (col_lo[ee] - intercept) / slope;
+                        }
+
+                        // Same "absorbed" pattern as the singleton-row
+                        // block above: a tighten_* that returns false
+                        // because the current bound was ALREADY at least
+                        // as tight is fine (nothing lost); one that
+                        // returns false while the implied bound WOULD
+                        // have been a genuine improvement can only mean it
+                        // was declined as numerically unreliable (would
+                        // cross) -- in which case the whole elimination
+                        // must be declined too, not just the bound, or a
+                        // point reachable in the reduced problem could
+                        // postsolve to an x_e outside its own true range.
+                        const bool took_lower = tighten_lower(ss, implied_s_lo);
+                        const bool took_upper = tighten_upper(ss, implied_s_hi);
+                        const bool absorbed_s =
+                            (took_lower || !std::isfinite(implied_s_lo) ||
+                             implied_s_lo <= col_lo[ss] + kBoundRelax * (1.0 + std::fabs(implied_s_lo))) &&
+                            (took_upper || !std::isfinite(implied_s_hi) ||
+                             implied_s_hi >= col_hi[ss] - kBoundRelax * (1.0 + std::fabs(implied_s_hi)));
+
+                        if (absorbed_s) {
+                            result.doubleton_eliminations.push_back(
+                                {e, s, intercept, slope, col_lo[ee], col_hi[ee]});
+                            result.column_removed[ee] = 1;
+                            result.column_is_doubleton[ee] = 1;
+                            col_active[ee] = 0;
+                            // See working_obj's own comment above: x_e's
+                            // cost contributes c_e*slope*x_s to the true
+                            // objective once substituted, which must be
+                            // folded into x_s's coefficient here, using
+                            // x_e's CURRENT (not necessarily original)
+                            // working_obj so a chain of eliminations
+                            // accumulates correctly.
+                            working_obj[ss] += working_obj[ee] * slope;
+                            drop_row(i);
+                            changed = true;
+                            continue;
+                        }
+                        // else: declined (would cross); leave the row for
+                        // the simplex, same policy as everywhere else in
+                        // this file.
+                    }
+                }
+            }
         }
         if (infeasible) break;
 
@@ -577,7 +769,7 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
     out.upper.resize(static_cast<std::size_t>(rn));
     for (std::int32_t k = 0; k < rn; ++k) {
         const auto orig = static_cast<std::size_t>(result.kept_columns[static_cast<std::size_t>(k)]);
-        out.obj[static_cast<std::size_t>(k)] = problem.obj[orig];
+        out.obj[static_cast<std::size_t>(k)] = working_obj[orig];
         out.lower[static_cast<std::size_t>(k)] = col_lo[orig];
         out.upper[static_cast<std::size_t>(k)] = col_hi[orig];
     }
@@ -623,11 +815,36 @@ std::vector<double> postsolve(const PresolveResult& result,
     std::vector<double> x(static_cast<std::size_t>(result.original_n_cols), 0.0);
     for (std::int32_t j = 0; j < result.original_n_cols; ++j) {
         const auto jj = static_cast<std::size_t>(j);
-        if (result.column_removed[jj]) x[jj] = result.fixed_value[jj];
+        // A doubleton-eliminated column's value is not a constant -- see
+        // the reverse-replay loop below -- so fixed_value[jj] is skipped
+        // for it here, matching PresolveResult's own documented contract.
+        const bool is_doubleton =
+            jj < result.column_is_doubleton.size() && result.column_is_doubleton[jj];
+        if (result.column_removed[jj] && !is_doubleton) x[jj] = result.fixed_value[jj];
     }
     const auto kept = result.kept_columns.size();
     for (std::size_t k = 0; k < kept && k < reduced_x.size(); ++k) {
         x[static_cast<std::size_t>(result.kept_columns[k])] = reduced_x[k];
+    }
+    // Doubleton eliminations were recorded in DISCOVERY order, and a later
+    // elimination's target_col is guaranteed to have been active (hence
+    // already correctly valued above, either directly or by an EARLIER
+    // entry in this same list) at the moment it was recorded -- replaying
+    // in REVERSE therefore always resolves a dependency before it is
+    // needed, with no separate topological sort. See PresolveResult's own
+    // comment on doubleton_eliminations for the full argument.
+    for (auto it = result.doubleton_eliminations.rbegin();
+         it != result.doubleton_eliminations.rend(); ++it) {
+        double value = it->intercept + it->slope * x[static_cast<std::size_t>(it->target_col)];
+        // Clamp into eliminated_col's own recorded range -- see
+        // DoubletonElimination's own comment (Presolve.hpp) for why this is
+        // necessary, not merely defensive: the implied bound placed on
+        // target_col during presolve is deliberately relaxed outward, and
+        // that slack, carried through intercept/slope, can otherwise land
+        // `value` fractionally outside eliminated_col's true bound.
+        value = std::min(value, it->eliminated_upper);
+        value = std::max(value, it->eliminated_lower);
+        x[static_cast<std::size_t>(it->eliminated_col)] = value;
     }
     return x;
 }

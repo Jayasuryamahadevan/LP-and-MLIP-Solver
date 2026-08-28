@@ -85,6 +85,9 @@ int main(int argc, char** argv) {
     // solves of the identical instance disagree on objective or iteration
     // count, that is flagged, not averaged away.
     const int repeats = (argc > 7) ? std::max(1, std::atoi(argv[7])) : 1;
+    // argv[8]: "doubleton" enables LpSolverOptions::enable_doubleton_
+    // substitution (off by default, matching that option's own default).
+    const bool doubleton = argc > 8 && std::string(argv[8]) == "doubleton";
     // SIHPS_PDLP_ADAPTIVE=0 disables the adaptive step size for the whole
     // sweep. An environment variable rather than another positional
     // argument because this exists to A/B one default, not to be a
@@ -112,9 +115,9 @@ int main(int argc, char** argv) {
     std::printf("build %s (%s)  %s  CUDA %s  %s\n", meta.git_commit.c_str(),
                 meta.git_dirty.c_str(), meta.compiler.c_str(), meta.cuda_version.c_str(),
                 meta.gpu_name.c_str());
-    std::printf("threads=%d  method=%s  presolve=%s  pdlp_adaptive=%s\n\n",
+    std::printf("threads=%d  method=%s  presolve=%s  pdlp_adaptive=%s  doubleton=%s\n\n",
                 meta.thread_count, cfg.method.c_str(), cfg.presolve ? "on" : "off",
-                pdlp_adaptive ? "on" : "off");
+                pdlp_adaptive ? "on" : "off", doubleton ? "on" : "off");
 
     std::unique_ptr<bench::JsonlWriter> writer;
     if (!jsonl_path.empty()) {
@@ -179,6 +182,7 @@ int main(int argc, char** argv) {
         options.use_presolve = use_presolve;
         if (hybrid) options.method = LpMethod::HYBRID;
         options.pdlp.adaptive_step = pdlp_adaptive;
+        options.enable_doubleton_substitution = doubleton;
 
         LpSolution result;
         std::vector<double> rep_seconds;

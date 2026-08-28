@@ -121,6 +121,12 @@ struct LpSolverOptions {
     // inferring it (see MilpProblem.hpp's own note on why the LP engine
     // does not see integrality metadata by default).
     std::vector<char> integer_columns;
+
+    // Threaded straight through to presolve()'s own
+    // `enable_doubleton_substitution` parameter (see Presolve.hpp). False
+    // by default pending a KPI-gate benchmark, matching this project's own
+    // standing rule for every optimization shipped this session.
+    bool enable_doubleton_substitution = false;
 };
 
 struct LpSolution {

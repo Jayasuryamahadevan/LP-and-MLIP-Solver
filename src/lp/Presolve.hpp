@@ -38,9 +38,53 @@ struct PresolveResult {
 
     // For every original column removed by presolve, the value it was
     // fixed at. Indexed by ORIGINAL column; meaningful only where
-    // column_removed is true.
+    // column_removed is true AND column_is_doubleton is false -- a
+    // doubleton-eliminated column's value is not a constant, see
+    // doubleton_eliminations below.
     std::vector<double> fixed_value;
     std::vector<char> column_removed;
+
+    // A doubleton-eliminated column: original column eliminated_col was
+    // removed by expressing it as an EXACT affine function of target_col,
+    //   x[eliminated_col] = intercept + slope * x[target_col]
+    // Recorded in DISCOVERY order (the order presolve found them in,
+    // across passes). target_col is guaranteed, by construction, to have
+    // been ACTIVE at the moment this was recorded -- a doubleton row can
+    // only choose an active column as its surviving variable -- so any
+    // later event that removes target_col (an ordinary fix, or a further
+    // doubleton) is necessarily recorded AFTER this one. Replaying this
+    // list in REVERSE (see postsolve() below) therefore always resolves a
+    // dependency before it's needed, with no separate topological sort:
+    // this is exactly the "replay the log in reverse" contract
+    // SYSTEM.md \S2.3 describes for postsolve.
+    struct DoubletonElimination {
+        std::int32_t eliminated_col = -1;
+        std::int32_t target_col = -1;
+        double intercept = 0.0;
+        double slope = 0.0;
+        // eliminated_col's own bounds AT THE MOMENT of elimination (already
+        // reflecting every reduction applied so far, so the tightest
+        // correct range known for it). postsolve() clamps the reconstructed
+        // value into this range: the implied bound placed on target_col is
+        // deliberately relaxed outward (this file's own kBoundRelax
+        // policy, applied everywhere so no reduction ever over-tightens),
+        // and that outward slack, carried through intercept/slope, can let
+        // the reconstructed x[eliminated_col] land fractionally outside its
+        // own true bound -- harmless in relative terms, but large enough in
+        // absolute terms on a big-magnitude model (MEASURED on Netlib
+        // `greenbea`/`greenbeb`: a bound violation of ~1.4e-6, just over
+        // this project's 1e-6 final verification gate) to fail the
+        // original-space check without the clamp.
+        double eliminated_lower = -kInfinity;
+        double eliminated_upper = kInfinity;
+    };
+    std::vector<DoubletonElimination> doubleton_eliminations;
+    // column_removed[j] is still set for a doubleton-eliminated column (so
+    // removed_cols() and any other existing caller of column_removed keeps
+    // working unmodified), but fixed_value[j] is NOT meaningful for it --
+    // this flag distinguishes the two removal kinds so postsolve() knows
+    // which mechanism to use for column j.
+    std::vector<char> column_is_doubleton;
 
     std::int32_t original_n_rows = 0;
     std::int32_t original_n_cols = 0;
@@ -75,14 +119,29 @@ struct PresolveResult {
 //                            every variable in it is pinned to one bound
 //   - activity-based bound tightening (bound propagation)
 //   - integer bound rounding (see `integer_columns` below)
+//   - doubleton-equation substitution, SCOPED (see `enable_doubleton_
+//     substitution` below) -- NOT the general case
 //
-// Reductions deliberately NOT applied, and why: doubleton-equation
-// substitution and free-column-singleton substitution both change the
-// sparsity pattern of A and require reconstructing an eliminated variable
-// from a row equation during postsolve. They are effective but their
-// postsolve is materially harder to get right, and SYSTEM.md \S2.3 makes
-// exact invertibility a hard invariant rather than a target. They are
-// candidates for a later milestone, once this set is validated.
+// Reduction deliberately NOT applied in its general form, and why: a
+// doubleton row's eliminated variable, in general, can appear in OTHER
+// active rows too, and folding its contribution into those rows requires
+// mutating coefficients this file currently treats as immutable (`A`/
+// `A_csc`, read once at entry) and can introduce fill-in (a nonzero in a
+// row that previously had a structural zero there). That is a materially
+// larger, more invasive change than anything else in this file, and this
+// project's own recent history (docs/ROADMAP_STATUS.md items 4-5) shows
+// mathematically-correct changes to adjacent, equally load-bearing code
+// can still destabilize a specific Netlib instance (`pilot87`) via
+// floating-point summation order, purely from ADDED computation -- not
+// attempted here. What IS applied is the intersection of "doubleton row"
+// and "free-column singleton": the eliminated variable additionally
+// appears in NO other active row (checked via col_count), so no other
+// row's coefficients ever change and every existing call site
+// (row_activity, fix_column, drop_row, the propagation loop, the final
+// triplet emission) needs zero modification -- see `enable_doubleton_
+// substitution` below and doubleton_eliminations above for the exact
+// contract. The general (fill-in-capable) case remains a candidate for a
+// later milestone.
 //
 // NUMERICAL POLICY: every test below carries an explicit tolerance and is
 // applied CONSERVATIVELY -- a row is dropped only when redundancy is
@@ -108,12 +167,23 @@ struct PresolveResult {
 // treated as if no column were flagged integer, rather than indexed
 // out of bounds -- this is a defensive guard against a caller bug, not a
 // scenario this function's own contract expects to occur.
+//
+// `enable_doubleton_substitution`, false by default (this project's own
+// standing rule: no optimization ships default-on without a measured KPI
+// improvement -- see the GMI-cuts and RENS precedents). When true, an
+// equality row with exactly two active nonzero coefficients, where one of
+// the two variables appears in NO other active row, eliminates that
+// variable by substitution -- see `PresolveResult::doubleton_eliminations`
+// above for the exact contract and soundness argument.
 PresolveResult presolve(const LpProblem& problem, int max_passes = 20,
-                         const std::vector<char>& integer_columns = {});
+                         const std::vector<char>& integer_columns = {},
+                         bool enable_doubleton_substitution = false);
 
 // Expands a solution of the reduced problem back into ORIGINAL column
 // space: kept columns take their solved value, removed columns take the
-// value presolve fixed them at. `reduced_x` must have size
+// value presolve fixed them at (or, for a doubleton-eliminated column,
+// its recorded affine function of another column -- see
+// PresolveResult::doubleton_eliminations). `reduced_x` must have size
 // result.kept_columns.size().
 std::vector<double> postsolve(const PresolveResult& result,
                                const std::vector<double>& reduced_x);

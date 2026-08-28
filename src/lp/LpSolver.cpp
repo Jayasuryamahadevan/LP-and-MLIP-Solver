@@ -133,7 +133,8 @@ LpSolution solve_lp(const LpProblem& problem, const LpSolverOptions& options) {
 
     if (options.use_presolve) {
         const auto t0 = std::chrono::steady_clock::now();
-        reduction = presolve(problem, 20, options.integer_columns);
+        reduction = presolve(problem, 20, options.integer_columns,
+                             options.enable_doubleton_substitution);
         solution.presolve_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
