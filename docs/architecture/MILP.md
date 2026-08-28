@@ -147,16 +147,34 @@ result on that shape of model.
 **Deliberately scoped down, per this session's own established practice of
 saying explicitly what was left out and why**: coefficient tightening / GCD-
 based reductions (the other half of `HIGHS_GAP_ANALYSIS.md`'s #2 item) are
-the natural next increment, particularly for `markshare2` (a deliberately
-adversarial Cornuéjols & Dawande 1999 construction whose binary columns have
-integer-valued matrix coefficients that this reduction alone does not
-exploit) — not attempted here. An adversarial-generator fuzz gate (mirroring
-`tests/lp/adversarial_lp_generator.hpp`'s existing role for other presolve/
-cut work) was also considered and scoped out for this increment, given the
-soundness argument above is unconditional rather than empirically fragile,
-unlike the fill-ordering work earlier this session — a candidate for a
-future pass if this reduction is ever extended to a less trivially-sound
-form.
+a real technique in general, but were **checked directly against
+`markshare2`'s own coefficients, not assumed applicable, and found not to
+apply to this specific instance**: GCD-based tightening on a row
+`sum(a_i x_i) = b` only fires when `g = gcd(a_1..a_n) > 1` (either proving
+infeasibility if `g` does not divide `b`, or dividing the whole row through
+by `g`). A direct computation over all seven of `markshare2`'s rows (each a
+dense 60-variable equality, coefficients drawn from 1–99) found **every
+row's gcd is exactly 1** — six of the seven rows even contain an explicit
+coefficient of `1` outright. This is not a coincidence of this one instance:
+Cornuéjols & Dawande's own market-split construction draws coefficients
+uniformly at random specifically so that no such shared-factor structure is
+present, which is part of what makes the family adversarial to begin with.
+GCD tightening is therefore a dead end for `markshare2` specifically, and
+this document no longer names it as the natural next increment for that
+instance. `markshare2`'s actual difficulty is a fundamentally weak LP
+relaxation (a near-uninformative bound at every node — measured 99.57% gap
+even after 2.5M+ nodes, `§6.5` below), which the market-split literature
+addresses with specialized techniques outside ordinary LP-based branch-and-
+cut entirely (e.g. lattice/LLL-basis-reduction reformulation, Aardal et al.)
+— a materially larger undertaking than a presolve reduction, not attempted
+in this codebase and not currently prioritized, since this benchmark set's
+one market-split instance is a deliberately adversarial stress test rather
+than representative of the refinery-planning workloads this project targets.
+An adversarial-generator fuzz gate (mirroring `tests/lp/
+adversarial_lp_generator.hpp`'s existing role for other presolve/cut work)
+would still be the right correctness gate if GCD tightening is ever
+implemented for a different instance shape where it does apply — not ruled
+out in general, only ruled out for this specific benchmark instance.
 
 ## 2. Cuts
 
@@ -705,51 +723,78 @@ CXX-only (`nvcc` does not accept `-fsanitize=thread`, and this feature's
 own scope is entirely CPU-side per §6's own opening paragraph, so
 CXX-only coverage is exactly what needs validating; `src/cuda/*`
 compilation units are excluded from instrumentation, an explicit, stated
-scope limit rather than a silent gap). The full functional test suite,
-including `tests/milp/test_milp_parallel.cpp`'s worker-count-1/2/4/8
-correctness sweep and its repeated-run determinism stress tests, passes
-cleanly under this build (165/165) — **MEASURED**.
+scope limit rather than a silent gap).
 
-`ThreadSanitizer` itself reported 47 warnings on this first-ever run,
-which were investigated individually (not assumed benign) rather than
-waved away. Every single one traces to the same pattern, on code that
-predates this feature entirely: a write or read inside a GCC-outlined
-OpenMP `._omp_fn.0` region (`CSRMatrix::multiply`, `Simplex.cpp`'s
-pricing/tableau/duals routines, `Presolve.cpp`, `CSCMatrix`/`CSRMatrix`/
-`GpuSpMV` construction) racing against the main thread — or a
-still-running pooled OpenMP worker from a *previous* test's parallel
-region — through libgomp's internal team barrier. In every case the
-"previous write/read" side of the report resolves only to an
-unsymbolized `libgomp.so.1` frame, never to application code: this is
-the well-known GCC-libgomp limitation where the runtime's fork-join
-barrier carries no `ThreadSanitizer` happens-before annotation, so a
-correctly-OpenMP-synchronized write-then-read across the implicit
-barrier is indistinguishable, to TSan, from an actual race. This is a
-`KNOWN LIMITATION` of instrumenting GCC's OpenMP runtime with TSan, not
-a defect in this project's own synchronization logic, and not something
-this project can fix by changing its own code (annotating libgomp
-itself is out of scope).
+**This subsection was revised after its own first version turned out to
+describe an unreliable gate, not a fixed one — corrected here rather than
+left standing.** The first `ThreadSanitizer` run reported 47 warnings;
+every one was investigated individually and traced to the same root
+cause (below), and the subsection originally shipped with that
+explanation plus a `tools/tsan_suppressions.txt`
+(`called_from_lib:libgomp.so`) meant to silence them. That suppression
+does not actually work: re-running with `TSAN_OPTIONS=verbosity=1`
+showed it being *matched* against `libgomp.so` diagnostically, yet the
+race reports it was meant to silence still printed — `called_from_lib`
+evidently gates a different internal check than general race-report
+suppression once the racing instruction itself is application code, not
+library code. Because the suppression was inert, the warning count was
+never actually stable: a from-scratch run (no suppression) found 50, not
+47; adding `ignore_noninstrumented_modules=1` brought it to 32; a run
+under `OMP_NUM_THREADS=1` alone showed 0 once and then 1 on the very
+next official `ctest` invocation. Trusting any single one of these counts
+— including the original "47, all explained" — as a stable, re-checkable
+gate would have been exactly the kind of unverified confidence this
+project's own standing rule warns against.
 
-**What matters for this section's own claim**: zero of the 47 warnings
-name any symbol from `ParallelSearch.hpp` or the new worker-thread code
-in `MilpSolver.cpp` (`WorkerContext`, `IncumbentState`,
-`ConcurrentPriorityQueue`, `worker_loop`, `consider_incumbent_mt`) on
-either side of a report — verified directly against the full warning
-log, not inferred. This is exactly what the design in §6.1 predicts:
-`parallel_worker_count > 1` forces every node's LP relaxation to
-`ParallelMode::SERIAL`, so no two B&B worker threads ever enter an
-OpenMP parallel region concurrently, and the only new concurrency
-primitives this feature actually introduces (`std::mutex`,
+Root cause, confirmed by reading full stack traces rather than assumed:
+GCC's stock `libgomp` (not itself built with `-fsanitize=thread`) does
+not expose its internal worker-thread-pool barrier/join synchronization
+to `ThreadSanitizer`'s happens-before tracker. A `#pragma omp parallel`
+region's own implicit barrier is real and correct; TSan simply cannot
+see it through an uninstrumented runtime, so it reports the worker
+thread's write and the main thread's post-join read as unsynchronized.
+Every one of the 47-then-50 raw warnings traced to this same pattern in
+code that predates this change entirely (`CSRMatrix::multiply`,
+`Simplex.cpp`'s pricing/tableau/duals routines, `Presolve.cpp`,
+`CSCMatrix`/`CSRMatrix`/`GpuSpMV` construction) — zero named any symbol
+from `ParallelSearch.hpp` or the new worker-thread code in
+`MilpSolver.cpp` (`WorkerContext`, `IncumbentState`,
+`ConcurrentPriorityQueue`, `worker_loop`, `consider_incumbent_mt`), on
+either side of any report, in any of the runs above. This is exactly
+what §6.1's design predicts: `parallel_worker_count > 1` forces every
+node's LP relaxation to `ParallelMode::SERIAL`, so no two B&B worker
+threads ever enter an OpenMP parallel region concurrently, and the only
+concurrency primitives this feature actually introduces (`std::mutex`,
 `std::condition_variable`, `std::atomic`, `std::thread`) are all
-TSan-transparent by design. The honest scope of this validation is
-therefore: **the new parallel-B&B synchronization code is TSan-clean;
-this project's separate, pre-existing OpenMP-parallel LP code has not
-been, and still is not, validated under TSan**, because GCC's libgomp
-cannot be validated this way at all. Left as an explicit, named gap
-rather than a silent one — a different verification method (not TSan)
-would be needed to give that older code the same kind of scrutiny, and
-is not attempted here since it is unrelated to this increment's own
-scope.
+TSan-transparent by construction. This is a `KNOWN LIMITATION` of
+instrumenting GCC's OpenMP runtime with TSan, not a defect in this
+project's own synchronization logic.
+
+**The actual fix** does not rely on a suppression file at all.
+`tests/sparse/test_parallel.cpp` is the one file in this suite that
+calls `omp_set_num_threads(N>1)` itself (to compare its own N=1-vs-N>1
+results bit-for-bit), which is why `OMP_NUM_THREADS=1` alone was flaky —
+it controls the *ambient* thread count every other file relies on, but
+this one file overrides it directly. `tests/CMakeLists.txt` now excludes
+that one file from the TSan-instrumented `sihps_tests` binary (guarded by
+`SIHPS_ENABLE_TSAN`; its own bit-identical-across-thread-count assertions
+still run, unaffected, in every normal build and CI invocation) and sets
+`OMP_NUM_THREADS=1` for every remaining file, which does read the
+ambient count. `tools/tsan_suppressions.txt` has been removed — it was
+not doing anything.
+
+**MEASURED**: with this fix, 3 repeated full-suite runs (`ctest`,
+`build-tsan/`, single process, nothing else running) each reported **0
+`ThreadSanitizer` warnings** and **162/162 tests passing** (165 minus the
+3 tests in the one excluded file) — a genuinely deterministic, mechanical
+pass/fail gate, not a count a human must re-triage on every run. This
+includes `tests/milp/test_milp_parallel.cpp`'s worker-count-1/2/4/8
+correctness sweep and its repeated-run determinism stress tests. The
+scope of what TSan validates here is unchanged from before: the new
+parallel-B&B synchronization code is TSan-clean; this project's separate,
+pre-existing OpenMP-parallel LP code is not validated by TSan at all
+(GCC's libgomp cannot be, full stop) and would need a different method
+entirely, which remains out of scope for this increment.
 
 ### 6.5 MEASURED
 

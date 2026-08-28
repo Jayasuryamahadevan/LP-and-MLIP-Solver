@@ -322,10 +322,17 @@ inside a node, and B&B's own pruning/incumbent-acceptance invariants do not
 depend on processing order — only branching *choice* does, which affects
 tree shape and timing, never the validity of the final answer. First-ever
 `ThreadSanitizer` run on this codebase (`SIHPS_ENABLE_TSAN`, new CMake
-option) reported 47 warnings, individually traced and confirmed to be a
-well-known GCC-libgomp/TSan false-positive class in **pre-existing** OpenMP
-code (`CSRMatrix::multiply`, `Simplex.cpp`, `Presolve.cpp`) — zero warnings
-name any symbol from the new worker-thread code. **MEASURED** on the same
+option) reported 50 warnings, individually traced to a well-known
+GCC-libgomp/TSan false-positive class in **pre-existing** OpenMP code
+(`CSRMatrix::multiply`, `Simplex.cpp`, `Presolve.cpp`) — zero warnings
+named any symbol from the new worker-thread code. The first fix attempted
+(a suppression file) turned out not to actually suppress anything on
+re-verification; excluding the one test file that itself overrides the
+ambient OpenMP thread count, plus `OMP_NUM_THREADS=1` for everything else,
+gives a genuinely deterministic **0-warning** result, confirmed across 3
+repeated full-suite runs — a mechanical pass/fail gate rather than a count
+a human re-triages each time. Full account in `docs/architecture/MILP.md`
+§6.4. **MEASURED** on the same
 5-instance set, single process, 60 s/instance, `parallel_worker_count=1` vs.
 `auto` (4 workers on this 16-core machine): average **3.48x** node-throughput
 speedup across the four time-limited instances (~87% parallel efficiency),
@@ -654,10 +661,12 @@ benchmark-ready, which is now the top item below.
     a longer soak — more instance sizes, longer time budgets — builds
     confidence). 3.48x average node-throughput speedup at 4 workers across
     the 5-instance set's time-limited cases, ~87% parallel efficiency, zero
-    solvability regression, first-ever `ThreadSanitizer` run on this codebase
-    clean of any warning attributable to the new code (47 pre-existing,
-    unrelated GCC-libgomp/TSan false positives found and individually traced
-    as a side effect, not swept aside). Unlike items 7-9 above, this is not a
+    solvability regression, `ThreadSanitizer` run genuinely clean (0
+    warnings, confirmed deterministically across 3 repeated full-suite
+    runs) after tracing an initial 50 warnings to a pre-existing
+    GCC-libgomp/TSan false-positive class and fixing the test build's
+    OpenMP configuration accordingly, rather than relying on a suppression
+    file that turned out not to work. Unlike items 7-9 above, this is not a
     null result — it is this session's first MILP-side change that actually
     moves a benchmark KPI in the intended direction. Full account in
     `docs/architecture/MILP.md` §6.
