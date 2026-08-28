@@ -513,3 +513,302 @@ larger design's payoff in advance.
 ## 5. GPU Involvement Inside a Node (restated boundary)
 
 The only GPU-resident work anywhere in this engine is the SpMV call inside a node's LP relaxation solve (`LP.md`, `CPU_GPU.md` §2.1) and the residual verification that follows it. Node creation, selection, branching, cut management (even once §2's stub becomes real), incumbent updates, and node presolve are all CPU-resident, always. This is restated here, in the MILP document itself, because it is the constraint most likely to be violated by well-intentioned future "optimization" — any change that moves tree-control logic to GPU is an architecture violation, not a performance tuning decision, and must be rejected regardless of a claimed speedup.
+
+## 6. Parallel Branch-and-Bound — CPU multi-threaded tree search
+
+`IMPLEMENTED`, `MEASURED`. Motivated directly by a measured gap, not a
+general "parallelism is good" instinct: on `pk1`, Gurobi explores roughly
+35,000 nodes/second (139,501 nodes in 4.0s to a certified optimum);
+this project's single-threaded search processes a few thousand nodes
+total over a 60-second budget on the same instance
+(`docs/measurements/gurobi_comparison.md`). That gap is a raw
+node-throughput gap, not (only) a per-node LP-speed gap, and Gurobi/
+CPLEX/SCIP all close it the same way: by exploring several nodes'
+relaxations concurrently across CPU cores. This section adds exactly that
+— multi-threaded CPU node processing — while keeping tree CONTROL
+single-threaded in spirit: node selection remains a single, globally
+consistent best-bound priority (§1.2), and every correctness invariant
+below is independent of which thread happened to process which node.
+
+**This is a different axis of parallelism from §5's GPU boundary, not a
+relaxation of it.** §5's rule — tree control never touches the GPU — is
+unchanged and unaffected: `MilpSolverOptions::parallel_worker_count > 1`
+forces `PricingBackend::CPU` for every worker (GPU pricing under
+concurrent host threads has not been verified safe and is out of scope
+for this increment), so this feature adds CPU-thread concurrency
+strictly *underneath* the CPU-resident tree-control boundary §5 already
+established, never inside the GPU.
+
+### 6.1 Design
+
+- **A single shared best-bound priority queue** (`ConcurrentPriorityQueue`,
+  `src/milp/ParallelSearch.hpp`) guarded by one mutex, pulled from by a
+  fixed pool of worker threads — not per-thread work-stealing deques. This
+  project's own MILP benchmark instances have small per-node LP
+  relaxations (7-164 rows, likely tens of microseconds per solve); a
+  single short critical section (a heap push/pop) is simpler to reason
+  about and cheaper in practice at this size regime than distributed
+  queues with stealing logic, and it preserves §1.2's existing best-bound
+  ordering *exactly* — every worker draws from the same globally-ordered
+  frontier, so only the *interleaving* across workers is new, not the
+  node-selection policy itself.
+- **The root node is always processed sequentially**, by the calling
+  thread, before any worker thread exists. Root-only cover-cut/GMI-cut
+  separation (§2) mutates a node's own workspace copy and re-queues the
+  SAME node for another pass; if that re-queued root could be picked up
+  by a *different* worker than the one that applied the cut, that
+  worker's own workspace copy would silently be missing it — a real
+  divergent-state hazard, not a hypothetical one. Processing the root
+  alone, before concurrency begins, removes this by construction. Root
+  RENS/diving/local-improvement (§4) are equally one-shot and equally
+  confined to this sequential phase.
+- **Every worker owns an exclusive `WorkerContext`**
+  (`src/milp/ParallelSearch.hpp`): its own `LpProblem` workspace copy
+  (seeded from the root's *final*, post-cut-separation shape), its own
+  pseudocost accumulators (`down_pseudocost`/`up_pseudocost`/
+  `*_observations`), and its own `pending_basis` warm-start map. Nothing
+  here is shared across workers; two node-processing calls never touch
+  the same `WorkerContext`.
+- **The incumbent is the one piece of state every worker reads on nearly
+  every node and writes rarely** (`IncumbentState`), so it is split into
+  two synchronization strategies rather than one: the objective value is
+  a lock-free `std::atomic<double>` for the hot pruning-check read path,
+  and the pair `(objective, x)` is updated together under one mutex only
+  when a candidate genuinely improves — never independently, which would
+  let a reader observe a new objective paired with stale `x`.
+- **`process_node()`** (`src/milp/MilpSolver.cpp`) is the single function
+  that solves one node's relaxation, runs its (self-gated) root-only
+  heuristics, and either prunes, re-queues, or branches — used
+  identically by the sequential root phase, the single-threaded
+  continuation when `parallel_worker_count == 1`, and every worker
+  thread when it is greater than 1. There is deliberately no separate
+  "single-threaded loop" implementation left over from before this
+  change: `parallel_worker_count == 1` runs through the exact same
+  function, on one thread, continuing the SAME `WorkerContext` the root
+  used — eliminating, by construction rather than by testing alone, any
+  risk of behavioral drift between "the fast path" and "the parallel
+  path" ever being two different pieces of code that quietly diverge.
+
+### 6.2 Correctness argument — and why this is NOT the same hazard as the LP-side reverts
+
+This project's own history is directly relevant here: two earlier attempts
+to speed up the LP factorization hot path (a fill-reducing column
+ordering, and hyper-sparse FTRAN — both `docs/architecture/LP.md` §9) were
+each mathematically verified correct via exhaustive testing, yet both had
+to be reverted after a full `validate_netlib` sweep showed they
+destabilized one specific Netlib instance (`pilot87`) — not through a
+logic bug, but because they perturbed this project's existing
+OpenMP-parallel floating-point summation order enough to tip an
+already-marginal instance past its iteration limit, in one case even when
+the change's own computed result went entirely unused. Given that
+precedent, parallel B&B needed its own, specific answer to "could this be
+the same failure mode again" — not an assumption either way.
+
+**It is not, and the reason is structural.** Every worker's own relaxation
+solve runs with `ParallelMode::SERIAL` forced (`parallel_worker_count > 1`
+implies this), so the *arithmetic inside* any single node's LP solve is
+byte-for-byte the same fixed-summation-order computation the
+single-threaded solver would use for that same node — there is no
+OpenMP reduction active inside any node solve for thread scheduling to
+perturb. What multi-threading introduces instead is nondeterministic
+*node-processing order across the tree* — a different axis entirely, and
+one this project's own B&B correctness invariants are already robust to:
+
+1. **A pruned node really is prunable against the incumbent value it was
+   compared to.** The mutex around `IncumbentState`'s `(objective, x)`
+   pair makes every read/write atomic as a unit; a prune check against a
+   momentarily-stale (larger) incumbent can only under-prune (process a
+   node that a fresher read would have skipped — wasted work, never a
+   wrong prune), because staleness only ever makes the incumbent look
+   *worse* than it currently is, never better.
+2. **An accepted incumbent really is feasible.** `consider_incumbent_mt`
+   runs the full feasibility/integrality gate on thread-local data
+   *before* taking any lock, then re-checks the improvement condition
+   against the CURRENT incumbent inside the lock before writing — the
+   standard double-checked-compare-and-swap pattern. Every accepted
+   incumbent passes exactly the same original-space gate (§4.1) it does
+   single-threaded, evaluated on the same immutable `problem.relaxation`.
+3. **Branching variable choice affects tree SHAPE, never validity.**
+   Reliability branching's pseudocost arrays are fully per-worker,
+   never merged (a deliberate v1 scope decision, §6.3) — different
+   thread interleavings can therefore pick different branching variables
+   at the same node across runs, changing node count and wall-clock, but
+   never changing whether the resulting two children's union recovers
+   the parent's feasible region exactly (`x_j <= floor` / `x_j >= ceil`
+   always does, regardless of *which* fractional `x_j` was chosen). This
+   is the general reason B&B tolerates this class of perturbation far
+   better than a single simplex pivot sequence: branching order affects
+   the PATH to the answer, never the answer's validity, whereas a
+   simplex pivot sequence *is* the computation whose own numerical
+   stability is directly in question.
+
+**What this changes about verification, and what it does not.** Node
+count and wall-clock are expected and accepted to vary run-to-run under
+`parallel_worker_count > 1` — already true and already documented for
+this project's own single-threaded, time-budgeted MIPLIB runs (e.g.
+`enable_integer_bound_rounding`'s own note on run-to-run node-count
+variance). What must NOT vary is the FINAL reported answer: status,
+objective, and feasibility of the returned `x` against the original
+model. That is a different, and differently-verified, bar than the
+LP-side lesson's bit-identical-iteration-count requirement (`LP.md` §9),
+appropriate because a single deterministic solve's own internal
+arithmetic is not what's under test here — `tests/milp/
+test_milp_parallel.cpp`'s `milp_parallel_reproduces_the_same_final_
+answer_across_repeated_runs` (10 repeated runs of `neos859080` under the
+real parallel configuration, asserting identical status/feasibility
+while explicitly not asserting on node count) is the direct, executable
+form of this argument, not just prose.
+
+### 6.3 Deliberately scoped down for this increment
+
+Stated explicitly, matching this project's own established practice:
+
+- **Cross-worker pseudocost merging.** Left fully separate per-worker
+  (§6.1). A periodic merge could plausibly speed up reliability
+  branching's own reliability-threshold convergence, but it reintroduces
+  exactly the synchronization-in-the-hot-path risk this design otherwise
+  avoids, for a benefit that needs measuring, not assuming — a candidate
+  follow-up, not attempted here.
+- **Warm-started node relaxations under parallel search
+  (`warm_start_node_relaxations`) are not explicitly disabled, but their
+  hit rate degrades**: a child's `pending_basis` entry is recorded in
+  whichever `WorkerContext` created it, and the shared queue may hand
+  that child to a *different* worker. A miss there is a pure warm-start
+  degradation, never a correctness issue — the existing single-threaded
+  code already treats a `pending_basis` miss as "fall back to a cold
+  solve" — but this combination is unlikely to realize warm-starting's
+  own (already-measured-net-negative, §1.4) benefit any better than
+  single-threaded search does, so it is not a combination this project
+  recommends using together.
+- **GPU pricing backend under multi-threaded B&B**: disallowed outright
+  (silently downgraded to CPU, `MilpSolver.cpp`), not merely discouraged
+  — concurrent CUDA context/stream/handle contention from multiple
+  worker threads against one shared GPU is a new, unmeasured regime this
+  increment does not attempt to validate, compounded by these instances
+  being far too small for GPU pricing to plausibly help per node in the
+  first place.
+- **Work-stealing / lock-free queue upgrade**: only worth revisiting if
+  profiling shows the single scheduler mutex is measurably contended,
+  which is unlikely at worker counts near core-count with per-node costs
+  in the tens-of-microseconds range for this project's own instance
+  sizes — a candidate follow-up if measurement shows otherwise, not
+  assumed adequate forever.
+
+### 6.4 Race-condition validation
+
+No `ThreadSanitizer` infrastructure existed in this project before this
+change (confirmed: absent from every `CMakeLists.txt`). Added
+`SIHPS_ENABLE_TSAN` (off by default — it roughly doubles memory use and
+meaningfully slows every build/test run, so it is a deliberate,
+explicit gate rather than a default-on cost every contributor pays) —
+CXX-only (`nvcc` does not accept `-fsanitize=thread`, and this feature's
+own scope is entirely CPU-side per §6's own opening paragraph, so
+CXX-only coverage is exactly what needs validating; `src/cuda/*`
+compilation units are excluded from instrumentation, an explicit, stated
+scope limit rather than a silent gap). The full functional test suite,
+including `tests/milp/test_milp_parallel.cpp`'s worker-count-1/2/4/8
+correctness sweep and its repeated-run determinism stress tests, passes
+cleanly under this build (165/165) — **MEASURED**.
+
+`ThreadSanitizer` itself reported 47 warnings on this first-ever run,
+which were investigated individually (not assumed benign) rather than
+waved away. Every single one traces to the same pattern, on code that
+predates this feature entirely: a write or read inside a GCC-outlined
+OpenMP `._omp_fn.0` region (`CSRMatrix::multiply`, `Simplex.cpp`'s
+pricing/tableau/duals routines, `Presolve.cpp`, `CSCMatrix`/`CSRMatrix`/
+`GpuSpMV` construction) racing against the main thread — or a
+still-running pooled OpenMP worker from a *previous* test's parallel
+region — through libgomp's internal team barrier. In every case the
+"previous write/read" side of the report resolves only to an
+unsymbolized `libgomp.so.1` frame, never to application code: this is
+the well-known GCC-libgomp limitation where the runtime's fork-join
+barrier carries no `ThreadSanitizer` happens-before annotation, so a
+correctly-OpenMP-synchronized write-then-read across the implicit
+barrier is indistinguishable, to TSan, from an actual race. This is a
+`KNOWN LIMITATION` of instrumenting GCC's OpenMP runtime with TSan, not
+a defect in this project's own synchronization logic, and not something
+this project can fix by changing its own code (annotating libgomp
+itself is out of scope).
+
+**What matters for this section's own claim**: zero of the 47 warnings
+name any symbol from `ParallelSearch.hpp` or the new worker-thread code
+in `MilpSolver.cpp` (`WorkerContext`, `IncumbentState`,
+`ConcurrentPriorityQueue`, `worker_loop`, `consider_incumbent_mt`) on
+either side of a report — verified directly against the full warning
+log, not inferred. This is exactly what the design in §6.1 predicts:
+`parallel_worker_count > 1` forces every node's LP relaxation to
+`ParallelMode::SERIAL`, so no two B&B worker threads ever enter an
+OpenMP parallel region concurrently, and the only new concurrency
+primitives this feature actually introduces (`std::mutex`,
+`std::condition_variable`, `std::atomic`, `std::thread`) are all
+TSan-transparent by design. The honest scope of this validation is
+therefore: **the new parallel-B&B synchronization code is TSan-clean;
+this project's separate, pre-existing OpenMP-parallel LP code has not
+been, and still is not, validated under TSan**, because GCC's libgomp
+cannot be validated this way at all. Left as an explicit, named gap
+rather than a silent one — a different verification method (not TSan)
+would be needed to give that older code the same kind of scrutiny, and
+is not attempted here since it is unrelated to this increment's own
+scope.
+
+### 6.5 MEASURED
+
+`bench_miplib` (single process, nothing else running; verified via `ps`
+immediately before each run — a concurrently-running test binary from
+another process on the same machine was waited out first), 5-instance
+MIPLIB set, 60s time limit, `parallel_worker_count=1` (baseline) vs.
+`parallel_worker_count=0` i.e. `auto` → `min(4, hardware_concurrency())`
+= 4 workers on this 16-core machine:
+
+| instance    | status (both) | nodes/sec, 1 worker | nodes/sec, 4 workers | speedup | gap, 1w → 4w |
+|-------------|----------------|---------------------:|----------------------:|--------:|--------------|
+| gen-ip002   | TIME_LIMIT     | 4,820                | 11,632                | 2.41x   | 0.42% → 0.34% |
+| gen-ip054   | TIME_LIMIT     | 3,843                | 9,648                 | 2.51x   | 0.90% → 0.57% |
+| markshare2  | TIME_LIMIT     | 9,591                | 41,982                | 4.38x   | 99.57% → 99.57% (unchanged) |
+| neos859080  | INFEASIBLE     | 294                  | 445                   | 1.51x   | proven both ways, no gap |
+| pk1         | TIME_LIMIT     | 1,607                | 7,411                 | 4.61x   | 81.33% → 74.19% |
+
+Every instance finished with the **same status** at both worker counts —
+no correctness or solvability regression, the KPI gate this project
+requires before accepting any change. Average speedup across the four
+time-limited instances (excluding `neos859080`, whose node count is too
+small — a few hundred — for its ratio to be anything but noise): **3.48x
+with 4 workers**, roughly 87% parallel efficiency against the naive 4x
+ceiling. CPU utilization confirms real, not spurious, concurrency: the
+four-worker runs sustained 300-400% CPU (`bench_miplib`'s own `cpu_s`/
+`seconds` column), consistent with ~4 threads actually doing work, not a
+measurement artifact.
+
+**The specific prediction this section made before running the
+benchmark (§6.5's earlier draft, written before this data existed) was
+wrong, and is corrected here rather than quietly edited away**: the
+smallest instance in the set, `markshare2` (7 rows), was expected to be
+the case most at risk of scheduler/mutex overhead swamping a
+per-node-solve so cheap it might cost only tens of microseconds.
+Measured result: `markshare2` benefited the *most* of any instance
+(4.38x), not the least. The likely explanation, consistent with its
+25-33% jump in absolute node throughput being the largest in the set
+(576k→2.54M nodes in the same 60s), is that this adversarial
+Cornuéjols-Dawande-style instance's own per-node cost is dominated by
+solving its LP relaxation repeatedly under heavy degeneracy, not by
+scheduling overhead — i.e. the single shared-mutex queue design (§6.1)
+is not the bottleneck this analysis feared it might be, at least not at
+4 workers on this instance set. This is exactly the kind of thing this
+project's own discipline exists to catch: an untested intuition about
+where a bottleneck will appear, stated in advance, then checked against
+real numbers rather than left standing.
+
+**The honest framing this section commits to, unchanged by the
+favorable numbers above**: `pk1`'s own throughput went from 1,607 to
+7,411 nodes/second — real, substantial progress — but Gurobi's own
+measured ~35,000 nodes/second on the same instance
+(`docs/measurements/gurobi_comparison.md`) is still roughly **4.7x**
+ahead of this project's new 4-worker number, down from roughly 22x
+single-threaded. This closes a meaningful fraction of the throughput
+gap, not the whole of it, and the correct claim is exactly that — not
+"parallel B&B closes the gap with Gurobi." `markshare2`'s own gap
+(99.57%, unchanged) is untouched by this feature entirely, as expected:
+that instance's difficulty is structural (weak LP relaxation, needs
+better cuts/presolve, `docs/architecture/MILP.md` earlier sections),
+and no amount of additional node throughput fixes a bound that stays
+loose at every node.

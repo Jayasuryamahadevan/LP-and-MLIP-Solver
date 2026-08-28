@@ -1,16 +1,20 @@
 #include "MilpSolver.hpp"
 
 #include "../parallel/Parallel.hpp"
+#include "ParallelSearch.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -641,14 +645,645 @@ std::vector<FractionalCandidate> fractional_candidates(const MilpProblem& proble
     return candidates;
 }
 
-double current_best_bound(const NodeQueue& queue, bool has_incumbent, double incumbent) {
-    if (!queue.empty()) return queue.top()->priority_bound;
+using SharedNodePtr = std::shared_ptr<const SearchNode>;
+using ConcurrentNodeQueue = ConcurrentPriorityQueue<SharedNodePtr, NodeCompare>;
+
+double current_best_bound(ConcurrentNodeQueue& queue, bool has_incumbent, double incumbent) {
+    const auto top_bound =
+        queue.best_priority_bound([](const SharedNodePtr& node) { return node->priority_bound; });
+    if (top_bound.has_value()) return *top_bound;
     return has_incumbent ? incumbent : kInfinityValue;
 }
 
 double relative_gap(bool has_incumbent, double incumbent, double best_bound) {
     if (!has_incumbent || !std::isfinite(best_bound)) return kInfinityValue;
     return std::max(0.0, (incumbent - best_bound) / (1.0 + std::fabs(incumbent)));
+}
+
+// Thread-safe incumbent acceptance -- the ONLY place `objective` and `x`
+// are updated together (see IncumbentState's own comment in
+// ParallelSearch.hpp for why that pairing needs one lock rather than a
+// lock-free CAS on the double alone). Behaviorally identical to the
+// pre-parallel `consider_incumbent` closure: same feasibility/integrality
+// gate, same strict-improvement comparison against the CURRENT incumbent
+// re-read under the lock (so two workers racing to install an improving
+// incumbent cannot both "win" -- only a genuine improvement over
+// whatever is there AT COMMIT TIME is accepted).
+bool consider_incumbent_mt(const MilpProblem& problem, const std::vector<double>& candidate,
+                            const std::vector<double>& lower, const std::vector<double>& upper,
+                            const LpProblem& workspace, const MilpSolverOptions& options,
+                            IncumbentState& inc) {
+    if (!feasible_point(problem, candidate, lower, upper, options.feasibility_tolerance,
+                         ParallelMode::SERIAL) ||
+        !integral_point(problem, candidate, options.integrality_tolerance)) {
+        return false;
+    }
+    const double candidate_objective = objective_value(workspace, candidate);
+    if (inc.clearly_worse(candidate_objective, options.objective_tolerance)) return false;
+
+    std::lock_guard<std::mutex> lock(inc.mutex);
+    const double current = inc.objective.load(std::memory_order_relaxed);
+    if (!std::isfinite(current) ||
+        candidate_objective <
+            current - options.objective_tolerance * (1.0 + std::fabs(current))) {
+        inc.x = candidate;
+        inc.objective.store(candidate_objective, std::memory_order_release);
+        ++inc.incumbent_updates;
+        return true;
+    }
+    return false;
+}
+
+// What happened to one popped node. `Branched` carries its two children;
+// every other outcome carries none. `Fatal` means a condition requiring
+// the WHOLE search to stop was detected (UNBOUNDED relaxation, or an
+// internal inconsistency this project treats as NUMERICAL_FAILURE rather
+// than guessing at); the specific status is recorded into the shared
+// SearchOutcome below by the caller, not returned here, since multiple
+// workers could each independently reach a Fatal outcome and only the
+// first one's status should stick.
+enum class NodeOutcome { Pruned, Requeue, Branched, Fatal, TimedOutMidHeuristic };
+
+struct NodeResult {
+    NodeOutcome outcome = NodeOutcome::Pruned;
+    MilpStatus fatal_status = MilpStatus::NUMERICAL_FAILURE;
+    SharedNodePtr left, right;
+    // Root-only reporting (a Requeue outcome from root's own cut
+    // separation): how many cuts were just added, so the single-threaded
+    // caller can attribute them to the right MilpSolution counter without
+    // process_node needing to know about MilpSolution's field layout.
+    std::size_t cover_cuts_added = 0;
+    std::size_t gmi_cuts_added = 0;
+};
+
+// Shared, read-mostly state every call to process_node needs, gathered
+// into one struct so the lambda capture list below stays legible rather
+// than an ever-growing by-reference capture of a dozen loose locals.
+struct SharedSearchState {
+    const MilpProblem& problem;
+    const MilpSolverOptions& options;
+    const LpSolverOptions& relaxation_options;
+    const std::vector<double>& root_lower;
+    const std::vector<double>& root_upper;
+    bool has_integer_variables = false;
+    ConcurrentNodeQueue& open;
+    IncumbentState& incumbent;
+    std::atomic<std::uint64_t>& next_node_order;
+    std::chrono::steady_clock::time_point start;
+    double time_limit_seconds = 0.0;
+
+    // Lazily-computed-once Ruiz scaling for warm-started direct-Simplex
+    // node solves (docs/architecture/LP.md \S1/\S2) -- std::call_once is
+    // exactly the right primitive for "compute once, then every reader
+    // sees a fully-published, read-only result," and avoids a bespoke
+    // double-checked-lock. Irrelevant (never touched) when
+    // warm_start_node_relaxations is off, its own default.
+    std::once_flag node_scale_once;
+    ScaleFactors node_scale;
+
+    // Root-only ("at most once each") guards, exactly mirroring the
+    // pre-parallel code's own root_cuts_separated/root_gmi_separated
+    // locals. Safe as plain (non-atomic) fields: node->depth == 0 is only
+    // ever true during the mandatory serial root phase, which is
+    // single-threaded by construction -- no worker thread ever calls
+    // process_node with a depth-0 node once the root has branched.
+    bool root_cuts_separated = false;
+    bool root_gmi_separated = false;
+
+    bool timed_out() const {
+        return time_limit_seconds > 0.0 &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
+                   time_limit_seconds;
+    }
+};
+
+// Processes exactly one popped node: solves its relaxation, runs root-only
+// cut separation/RENS/local-improvement (self-gating on node->depth == 0,
+// so this is safe to call from a worker thread on a non-root node -- those
+// blocks simply never fire there), runs the shallow-depth LP dive, and
+// either prunes, requeues (root cuts need the same node reprocessed once
+// its workspace has cuts appended), or branches into two children.
+//
+// Every mutable quantity this function touches beyond `shared` is either
+// `ctx` (this call's own WorkerContext -- never shared with another
+// thread) or `shared.incumbent`/`shared.open` (both independently
+// thread-safe by construction, per their own types). This is what makes
+// calling it from multiple worker threads simultaneously safe: no two
+// calls ever touch the same WorkerContext, and the two pieces of state
+// they DO share serialize their own critical sections internally.
+NodeResult process_node(SharedSearchState& shared, WorkerContext& ctx, const SharedNodePtr& node) {
+    const MilpProblem& problem = shared.problem;
+    const MilpSolverOptions& options = shared.options;
+    LpProblem& workspace = ctx.workspace;
+
+    const auto record_pseudocost = [&](const SearchNode& child, double child_bound,
+                                       bool infeasible) {
+        if (child.branch_variable < 0 || child.branch_distance <= 0.0 ||
+            !std::isfinite(child.priority_bound)) {
+            return;
+        }
+        const auto j = static_cast<std::size_t>(child.branch_variable);
+        const double unit_cost = infeasible
+                                     ? kInfinityValue
+                                     : std::max(0.0, child_bound - child.priority_bound) /
+                                           child.branch_distance;
+        if (child.branch_direction < 0) {
+            ctx.down_pseudocost[j] += unit_cost;
+            ++ctx.down_observations[j];
+        } else {
+            ctx.up_pseudocost[j] += unit_cost;
+            ++ctx.up_observations[j];
+        }
+    };
+    const auto reliable = [&](std::size_t j) {
+        return ctx.down_observations[j] >= options.reliability_threshold &&
+               ctx.up_observations[j] >= options.reliability_threshold;
+    };
+    const auto pseudocost_score = [&](const FractionalCandidate& candidate) {
+        const auto j = static_cast<std::size_t>(candidate.variable);
+        if (ctx.down_observations[j] == 0 || ctx.up_observations[j] == 0) return -1.0;
+        const double down = (ctx.down_pseudocost[j] / ctx.down_observations[j]) * candidate.fraction;
+        const double up =
+            (ctx.up_pseudocost[j] / ctx.up_observations[j]) * (1.0 - candidate.fraction);
+        return std::min(down, up);
+    };
+    const auto observe_pseudocost = [&](std::int32_t variable, int direction, double unit_cost) {
+        const auto j = static_cast<std::size_t>(variable);
+        if (direction < 0) {
+            ctx.down_pseudocost[j] += unit_cost;
+            ++ctx.down_observations[j];
+        } else {
+            ctx.up_pseudocost[j] += unit_cost;
+            ++ctx.up_observations[j];
+        }
+    };
+    const auto consider_incumbent = [&](const std::vector<double>& candidate,
+                                        const std::vector<double>& lower,
+                                        const std::vector<double>& upper) {
+        return consider_incumbent_mt(problem, candidate, lower, upper, workspace, options,
+                                      shared.incumbent);
+    };
+    const auto has_incumbent = [&] {
+        return std::isfinite(shared.incumbent.objective.load(std::memory_order_acquire));
+    };
+    const auto incumbent_value = [&] {
+        return shared.incumbent.objective.load(std::memory_order_acquire);
+    };
+
+    bool heuristic_timeout = false;
+    const auto attempt_lp_dive = [&](const LpSolution& starting,
+                                     const std::vector<double>& starting_lower,
+                                     const std::vector<double>& starting_upper) {
+        if (!options.use_diving_heuristic || options.diving_max_depth == 0 ||
+            options.diving_max_lp_relaxations == 0 || has_incumbent()) {
+            return;
+        }
+        LpSolution current = starting;
+        std::vector<double> dive_lower = starting_lower;
+        std::vector<double> dive_upper = starting_upper;
+        std::uint32_t dive_relaxations = 0;
+        for (std::uint32_t depth = 0; depth < options.diving_max_depth; ++depth) {
+            if (shared.timed_out()) {
+                heuristic_timeout = true;
+                return;
+            }
+            if (integral_point(problem, current.x, options.integrality_tolerance)) {
+                consider_incumbent(current.x, dive_lower, dive_upper);
+                return;
+            }
+            const auto candidates =
+                fractional_candidates(problem, current.x, options.integrality_tolerance);
+            if (candidates.empty()) return;
+
+            const FractionalCandidate& candidate = candidates.front();
+            const auto j = static_cast<std::size_t>(candidate.variable);
+            const double floor_value = std::floor(current.x[j]);
+            const double ceil_value = std::ceil(current.x[j]);
+            const int preferred_direction = workspace.obj[j] < 0.0 ? +1 : -1;
+            const auto solve_dive_child = [&](int direction) -> bool {
+                std::vector<double> child_lower = dive_lower;
+                std::vector<double> child_upper = dive_upper;
+                if (direction < 0) {
+                    child_upper[j] = std::min(child_upper[j], floor_value);
+                } else {
+                    child_lower[j] = std::max(child_lower[j], ceil_value);
+                }
+                if (!bounds_are_valid(child_lower, child_upper)) return false;
+                workspace.lower = child_lower;
+                workspace.upper = child_upper;
+                ++ctx.lp_relaxations;
+                ++ctx.diving_heuristic_lp_relaxations;
+                ++dive_relaxations;
+                const LpSolution child = solve_lp(workspace, shared.relaxation_options);
+                workspace.lower = dive_lower;
+                workspace.upper = dive_upper;
+                if (child.status != LpStatus::OPTIMAL ||
+                    child.x.size() != static_cast<std::size_t>(problem.n_cols())) {
+                    return false;
+                }
+                current = child;
+                dive_lower = std::move(child_lower);
+                dive_upper = std::move(child_upper);
+                return true;
+            };
+            if (dive_relaxations >= options.diving_max_lp_relaxations ||
+                (!solve_dive_child(preferred_direction) &&
+                 (dive_relaxations >= options.diving_max_lp_relaxations ||
+                  !solve_dive_child(-preferred_direction)))) {
+                return;
+            }
+        }
+        if (integral_point(problem, current.x, options.integrality_tolerance)) {
+            consider_incumbent(current.x, dive_lower, dive_upper);
+        }
+    };
+
+    const auto attempt_local_improvement = [&](const std::vector<double>& node_lower,
+                                               const std::vector<double>& node_upper) {
+        if (!options.use_local_improvement || options.local_improvement_passes == 0 ||
+            options.local_improvement_max_trials == 0 || !has_incumbent()) {
+            return;
+        }
+        std::vector<double> current;
+        {
+            std::lock_guard<std::mutex> lock(shared.incumbent.mutex);
+            current = shared.incumbent.x;
+        }
+        for (std::uint32_t pass = 0; pass < options.local_improvement_passes; ++pass) {
+            bool improved = false;
+            std::uint32_t trials = 0;
+            for (std::int32_t j = 0; j < problem.n_cols() &&
+                                      trials < options.local_improvement_max_trials;
+                 ++j) {
+                const auto jj = static_cast<std::size_t>(j);
+                if (problem.variable_types[jj] == VariableType::CONTINUOUS) continue;
+                if (!std::isfinite(current[jj])) continue;
+
+                std::vector<double> trial_lower = node_lower;
+                std::vector<double> trial_upper = node_upper;
+                for (std::int32_t k = 0; k < problem.n_cols(); ++k) {
+                    const auto kk = static_cast<std::size_t>(k);
+                    if (problem.variable_types[kk] == VariableType::CONTINUOUS) continue;
+                    const double fixed = std::round(current[kk]);
+                    trial_lower[kk] = std::max(trial_lower[kk], fixed);
+                    trial_upper[kk] = std::min(trial_upper[kk], fixed);
+                }
+                const double current_value = std::round(current[jj]);
+                double trial_value = current_value;
+                if (binary_domain(problem, problem.relaxation, j)) {
+                    trial_value = current_value <= 0.5 ? 1.0 : 0.0;
+                } else {
+                    const double up = current_value + 1.0;
+                    const double down = current_value - 1.0;
+                    if (up <= trial_upper[jj]) trial_value = up;
+                    else if (down >= trial_lower[jj]) trial_value = down;
+                    else continue;
+                }
+                trial_lower[jj] = std::max(trial_lower[jj], trial_value);
+                trial_upper[jj] = std::min(trial_upper[jj], trial_value);
+                if (!bounds_are_valid(trial_lower, trial_upper)) continue;
+
+                LpProblem local = workspace;
+                local.lower = trial_lower;
+                local.upper = trial_upper;
+                ++trials;
+                ++ctx.lp_relaxations;
+                ++ctx.local_improvement_lp_relaxations;
+                const LpSolution local_solution = solve_lp(local, shared.relaxation_options);
+                if (local_solution.status != LpStatus::OPTIMAL ||
+                    local_solution.x.size() != static_cast<std::size_t>(problem.n_cols())) {
+                    continue;
+                }
+                const double before = incumbent_value();
+                if (consider_incumbent(local_solution.x, node_lower, node_upper) &&
+                    incumbent_value() < before) {
+                    std::lock_guard<std::mutex> lock(shared.incumbent.mutex);
+                    current = shared.incumbent.x;
+                    improved = true;
+                }
+                if (shared.timed_out()) return;
+            }
+            if (!improved) break;
+        }
+    };
+
+    const auto attempt_rens = [&](const LpSolution& starting,
+                                  const std::vector<double>& starting_lower,
+                                  const std::vector<double>& starting_upper) {
+        if (!options.use_rens_heuristic) return;
+        if (integral_point(problem, starting.x, options.integrality_tolerance)) return;
+        std::vector<double> rens_lower = starting_lower;
+        std::vector<double> rens_upper = starting_upper;
+        for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
+            const auto jj = static_cast<std::size_t>(j);
+            if (problem.variable_types[jj] == VariableType::CONTINUOUS) continue;
+            const double value = starting.x[jj];
+            const double floor_value = std::floor(value);
+            const double ceil_value = std::ceil(value);
+            if (ceil_value - value <= options.integrality_tolerance ||
+                value - floor_value <= options.integrality_tolerance) {
+                const double fixed = std::round(value);
+                rens_lower[jj] = std::max(rens_lower[jj], fixed);
+                rens_upper[jj] = std::min(rens_upper[jj], fixed);
+            } else {
+                rens_lower[jj] = std::max(rens_lower[jj], floor_value);
+                rens_upper[jj] = std::min(rens_upper[jj], ceil_value);
+            }
+        }
+        if (!bounds_are_valid(rens_lower, rens_upper)) return;
+        LpProblem restricted = workspace;
+        restricted.lower = std::move(rens_lower);
+        restricted.upper = std::move(rens_upper);
+        ++ctx.lp_relaxations;
+        ++ctx.rens_heuristic_lp_relaxations;
+        const LpSolution restricted_solution = solve_lp(restricted, shared.relaxation_options);
+        if (restricted_solution.status != LpStatus::OPTIMAL ||
+            restricted_solution.x.size() != static_cast<std::size_t>(problem.n_cols())) {
+            return;
+        }
+        consider_incumbent(restricted_solution.x, starting_lower, starting_upper);
+    };
+
+    NodeResult result;
+    ++ctx.nodes_processed;
+
+    std::shared_ptr<const Simplex::Basis> node_parent_basis;
+    if (options.warm_start_node_relaxations) {
+        auto pending_it = ctx.pending_basis.find(node->order);
+        if (pending_it != ctx.pending_basis.end()) {
+            node_parent_basis = pending_it->second;
+            ctx.pending_basis.erase(pending_it);
+        }
+    }
+
+    if (has_incumbent() &&
+        node->priority_bound >=
+            incumbent_value() - options.objective_tolerance * (1.0 + std::fabs(incumbent_value()))) {
+        ++ctx.nodes_pruned;
+        result.outcome = NodeOutcome::Pruned;
+        return result;
+    }
+
+    std::vector<double> lower;
+    std::vector<double> upper;
+    materialize_bounds(*node, shared.root_lower, shared.root_upper, lower, upper);
+    if (!bounds_are_valid(lower, upper)) {
+        ++ctx.nodes_pruned;
+        result.outcome = NodeOutcome::Pruned;
+        return result;
+    }
+    workspace.lower = lower;
+    workspace.upper = upper;
+
+    ++ctx.lp_relaxations;
+    LpSolution relaxation;
+    std::shared_ptr<const Simplex::Basis> node_basis;
+    if (node->depth == 0 || !options.warm_start_node_relaxations) {
+        relaxation = solve_lp(workspace, shared.relaxation_options);
+    } else {
+        std::call_once(shared.node_scale_once, [&] {
+            shared.node_scale = shared.relaxation_options.use_ruiz_scaling
+                                     ? compute_ruiz_scaling(workspace.A)
+                                     : ScaleFactors::identity(workspace.n_rows(), workspace.n_cols());
+        });
+        Simplex simplex(workspace, shared.relaxation_options.backend,
+                        shared.relaxation_options.use_ruiz_scaling,
+                        shared.relaxation_options.pricing_rule, LpAlgorithm::AUTO,
+                        shared.relaxation_options.parallel_mode, &shared.node_scale);
+        if (shared.relaxation_options.simplex_time_budget_seconds > 0.0) {
+            simplex.set_time_budget(shared.relaxation_options.simplex_time_budget_seconds);
+        }
+        if (node_parent_basis) simplex.set_warm_start_basis(node_parent_basis.get());
+
+        const LpResult lp = simplex.solve();
+        relaxation.status = lp.status;
+        relaxation.x = lp.x;
+        relaxation.objective_value = lp.objective_value;
+        if (lp.used_warm_start) ++ctx.warm_started_relaxations;
+        if (lp.warm_start_attempted && !lp.used_warm_start) {
+            ++ctx.warm_start_verification_fallbacks;
+        }
+        if (lp.status == LpStatus::OPTIMAL) {
+            node_basis = std::make_shared<const Simplex::Basis>(simplex.export_basis());
+        }
+    }
+
+    if (relaxation.status == LpStatus::INFEASIBLE) {
+        record_pseudocost(*node, node->priority_bound, true);
+        ++ctx.nodes_pruned;
+        result.outcome = NodeOutcome::Pruned;
+        return result;
+    }
+    if (relaxation.status == LpStatus::UNBOUNDED) {
+        result.outcome = NodeOutcome::Fatal;
+        result.fatal_status =
+            shared.has_integer_variables ? MilpStatus::UNBOUNDED_RELAXATION : MilpStatus::UNBOUNDED;
+        return result;
+    }
+    if (relaxation.status != LpStatus::OPTIMAL ||
+        relaxation.x.size() != static_cast<std::size_t>(problem.n_cols())) {
+        result.outcome = NodeOutcome::Fatal;
+        result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
+        return result;
+    }
+
+    const double lower_bound = relaxation.objective_value;
+    record_pseudocost(*node, lower_bound, false);
+
+    if (node->depth == 0 && !shared.root_cuts_separated && options.enable_root_cover_cuts) {
+        shared.root_cuts_separated = true;
+        const auto cuts = separate_cover_cuts(problem, relaxation.x, options.cut_violation_tolerance,
+                                              options.max_root_cover_cuts);
+        if (!cuts.empty()) {
+            append_cover_cuts(workspace, cuts);
+            result.outcome = NodeOutcome::Requeue;
+            result.cover_cuts_added = cuts.size();
+            return result;
+        }
+    }
+    if (node->depth == 0 && !shared.root_gmi_separated && options.enable_root_gmi_cuts) {
+        shared.root_gmi_separated = true;
+        Simplex gmi_simplex(workspace, PricingBackend::CPU, /*use_ruiz_scaling=*/false,
+                            shared.relaxation_options.pricing_rule, LpAlgorithm::AUTO,
+                            shared.relaxation_options.parallel_mode);
+        ++ctx.lp_relaxations;
+        const LpResult gmi_lp = gmi_simplex.solve();
+        if (gmi_lp.status == LpStatus::OPTIMAL &&
+            gmi_lp.x.size() == static_cast<std::size_t>(problem.n_cols())) {
+            const auto cuts =
+                separate_gmi_cuts(problem, workspace, gmi_simplex, gmi_lp.x,
+                                  options.cut_violation_tolerance, options.max_root_gmi_cuts);
+            if (!cuts.empty()) {
+                append_general_cuts(workspace, cuts);
+                result.outcome = NodeOutcome::Requeue;
+                result.gmi_cuts_added = cuts.size();
+                return result;
+            }
+        }
+    }
+
+    if (has_incumbent() &&
+        lower_bound >=
+            incumbent_value() - options.objective_tolerance * (1.0 + std::fabs(incumbent_value()))) {
+        ++ctx.nodes_pruned;
+        result.outcome = NodeOutcome::Pruned;
+        return result;
+    }
+
+    const bool candidate_integral =
+        integral_point(problem, relaxation.x, options.integrality_tolerance);
+    const std::vector<double> rounded = rounded_point(problem, relaxation.x, lower, upper);
+    if (candidate_integral || options.use_rounding_heuristic) {
+        const bool accepted = consider_incumbent(rounded, lower, upper);
+        if (!accepted && candidate_integral) {
+            result.outcome = NodeOutcome::Fatal;
+            result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
+            return result;
+        }
+    }
+    if (candidate_integral) {
+        result.outcome = NodeOutcome::Pruned;
+        return result;
+    }
+
+    if (node->depth == 0) {
+        attempt_rens(relaxation, lower, upper);
+        if (shared.timed_out()) {
+            result.outcome = NodeOutcome::TimedOutMidHeuristic;
+            return result;
+        }
+    }
+    if (node->depth <= 2 && !has_incumbent()) {
+        attempt_lp_dive(relaxation, lower, upper);
+        if (heuristic_timeout) {
+            result.outcome = NodeOutcome::TimedOutMidHeuristic;
+            return result;
+        }
+    }
+    if (node->depth == 0 && has_incumbent()) {
+        attempt_local_improvement(lower, upper);
+        if (shared.timed_out()) {
+            result.outcome = NodeOutcome::TimedOutMidHeuristic;
+            return result;
+        }
+    }
+
+    for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
+        const auto jx = static_cast<std::size_t>(j);
+        if (problem.variable_types[jx] != VariableType::CONTINUOUS &&
+            !std::isfinite(relaxation.x[jx])) {
+            result.outcome = NodeOutcome::Fatal;
+            result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
+            return result;
+        }
+    }
+
+    const std::vector<FractionalCandidate> candidates =
+        fractional_candidates(problem, relaxation.x, options.integrality_tolerance);
+    if (candidates.empty()) {
+        result.outcome = NodeOutcome::Fatal;
+        result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
+        return result;
+    }
+
+    std::int32_t branch_variable = candidates.front().variable;
+    if (options.branching_rule == MilpBranchingRule::PSEUDOCOST ||
+        options.branching_rule == MilpBranchingRule::RELIABILITY) {
+        if (options.branching_rule == MilpBranchingRule::RELIABILITY) {
+            std::uint32_t probes = 0;
+            for (const FractionalCandidate& candidate : candidates) {
+                const auto j = static_cast<std::size_t>(candidate.variable);
+                if (reliable(j)) continue;
+                if (probes >= options.strong_branching_candidates) break;
+                if (shared.timed_out()) {
+                    result.outcome = NodeOutcome::TimedOutMidHeuristic;
+                    return result;
+                }
+                const double floor_probe = std::floor(relaxation.x[j]);
+                const double ceil_probe = std::ceil(relaxation.x[j]);
+                const double down_distance = candidate.fraction;
+                const double up_distance = 1.0 - candidate.fraction;
+
+                auto probe_child = [&](int direction, double bound,
+                                       double distance) -> std::pair<bool, double> {
+                    std::vector<double> probe_lower = lower;
+                    std::vector<double> probe_upper = upper;
+                    if (direction < 0) {
+                        probe_upper[j] = std::min(probe_upper[j], bound);
+                    } else {
+                        probe_lower[j] = std::max(probe_lower[j], bound);
+                    }
+                    if (!bounds_are_valid(probe_lower, probe_upper)) return {true, kInfinityValue};
+                    workspace.lower = probe_lower;
+                    workspace.upper = probe_upper;
+                    ++ctx.lp_relaxations;
+                    ++ctx.strong_branching_probes;
+                    const LpSolution probe = solve_lp(workspace, shared.relaxation_options);
+                    workspace.lower = lower;
+                    workspace.upper = upper;
+                    if (probe.status == LpStatus::INFEASIBLE) return {true, kInfinityValue};
+                    if (probe.status != LpStatus::OPTIMAL || distance <= 0.0) return {false, 0.0};
+                    return {true, std::max(0.0, probe.objective_value - lower_bound) / distance};
+                };
+                const auto down_probe = probe_child(-1, floor_probe, down_distance);
+                const auto up_probe = probe_child(+1, ceil_probe, up_distance);
+                if (down_probe.first) observe_pseudocost(candidate.variable, -1, down_probe.second);
+                if (up_probe.first) observe_pseudocost(candidate.variable, +1, up_probe.second);
+                ++probes;
+            }
+        }
+        double best_score = -1.0;
+        for (const FractionalCandidate& candidate : candidates) {
+            const auto j = static_cast<std::size_t>(candidate.variable);
+            if (options.branching_rule == MilpBranchingRule::RELIABILITY && !reliable(j)) continue;
+            const double score = pseudocost_score(candidate);
+            if (score > best_score) {
+                best_score = score;
+                branch_variable = candidate.variable;
+            }
+        }
+    }
+
+    const auto jj = static_cast<std::size_t>(branch_variable);
+    const double floor_value = std::floor(relaxation.x[jj]);
+    const double ceil_value = std::ceil(relaxation.x[jj]);
+    if (floor_value >= ceil_value || !std::isfinite(floor_value) || !std::isfinite(ceil_value)) {
+        result.outcome = NodeOutcome::Fatal;
+        result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
+        return result;
+    }
+
+    auto left = std::make_shared<SearchNode>();
+    left->parent = node;
+    left->depth = node->depth + 1;
+    left->order = shared.next_node_order.fetch_add(1, std::memory_order_relaxed);
+    left->priority_bound = lower_bound;
+    left->change.variable = branch_variable;
+    left->change.upper = floor_value;
+    left->branch_variable = branch_variable;
+    left->branch_direction = -1;
+    left->branch_distance = relaxation.x[jj] - floor_value;
+
+    auto right = std::make_shared<SearchNode>();
+    right->parent = node;
+    right->depth = node->depth + 1;
+    right->order = shared.next_node_order.fetch_add(1, std::memory_order_relaxed);
+    right->priority_bound = lower_bound;
+    right->change.variable = branch_variable;
+    right->change.lower = ceil_value;
+    right->branch_variable = branch_variable;
+    right->branch_direction = +1;
+    right->branch_distance = ceil_value - relaxation.x[jj];
+
+    if (node_basis) {
+        ctx.pending_basis.emplace(left->order, node_basis);
+        ctx.pending_basis.emplace(right->order, node_basis);
+    }
+
+    result.outcome = NodeOutcome::Branched;
+    result.left = std::move(left);
+    result.right = std::move(right);
+    return result;
 }
 
 } // namespace
@@ -676,9 +1311,13 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
                    options.time_limit_seconds;
     };
 
-    // One mutable workspace reuses the original sparse matrix for every
-    // node. Copying the matrix per node would make a large B&B tree
-    // memory-bound before the LP solver had a chance to work.
+    // One mutable workspace, copied once per worker context (root's own,
+    // plus one per parallel worker if parallel_worker_count > 1) rather
+    // than per node -- copying the sparse matrix per node would make a
+    // large B&B tree memory-bound before the LP solver had a chance to
+    // work; copying it per WORKER is a small, fixed cost paid once at
+    // startup, given this project's own MILP benchmark instances (7-164
+    // rows) are small.
     LpProblem workspace = problem.relaxation;
     // LP is a minimization engine. Keep the public MILP model in its natural
     // objective sense and normalize only this private relaxation workspace.
@@ -700,33 +1339,10 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
     }
 
     auto root = std::make_shared<SearchNode>();
-    std::uint64_t next_node_order = 1;
-    NodeQueue open;
-    open.push(root);
+    std::atomic<std::uint64_t> next_node_order{1};
+    ConcurrentNodeQueue open;
 
-    double incumbent = kInfinityValue;
-    std::vector<double> incumbent_x;
-    bool relaxation_unbounded = false;
-    bool root_cuts_separated = false;
-    bool root_gmi_separated = false;
-
-    // Warm-started dual simplex for node relaxations
-    // (docs/architecture/LP.md \S1/\S2). Keyed by SearchNode::order,
-    // populated when a node's children are created and consumed-and-erased
-    // the moment that child is popped -- NOT a SearchNode field, since
-    // SearchNode::parent already keeps the whole ancestor chain alive for
-    // the rest of the search, and a Basis stored there would outlive its
-    // usefulness. This bounds the map to roughly the current queue width
-    // rather than the size of the whole tree.
-    std::unordered_map<std::uint64_t, std::shared_ptr<const Simplex::Basis>> pending_basis;
-    // Ruiz factors for workspace.A, computed once (lazily, on first use)
-    // AFTER root cover cuts have settled its final shape, and reused by
-    // every subsequent node's direct Simplex construction. workspace.A
-    // never changes again once cuts are separated (only lower_/upper_ do,
-    // one variable at a time), so recomputing this per node would spend
-    // exactly the cost warm-starting exists to avoid.
-    bool node_scale_ready = false;
-    ScaleFactors node_scale;
+    IncumbentState incumbent_state;
 
     LpSolverOptions relaxation_options = options.lp_options;
     relaxation_options.method = LpMethod::SIMPLEX;
@@ -748,625 +1364,238 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
         }
     }
 
-    std::vector<double> down_pseudocost(static_cast<std::size_t>(problem.n_cols()), 0.0);
-    std::vector<double> up_pseudocost(static_cast<std::size_t>(problem.n_cols()), 0.0);
-    std::vector<std::uint32_t> down_observations(static_cast<std::size_t>(problem.n_cols()), 0);
-    std::vector<std::uint32_t> up_observations(static_cast<std::size_t>(problem.n_cols()), 0);
+    const std::uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::uint32_t n_workers =
+        options.parallel_worker_count == 0 ? std::min(4u, hw) : options.parallel_worker_count;
+    // Force SERIAL per-node LP solves whenever more than one thread will
+    // ever touch this search (including the mandatory serial root phase,
+    // so root and workers behave identically) -- see
+    // MilpSolverOptions::parallel_worker_count's own doc comment. GPU
+    // pricing under concurrent host threads has not been verified safe
+    // and is out of scope for this increment (docs/architecture/MILP.md),
+    // so it is disabled outright rather than silently risked.
+    if (n_workers > 1) {
+        relaxation_options.parallel_mode = ParallelMode::SERIAL;
+        if (relaxation_options.backend == PricingBackend::GPU) {
+            relaxation_options.backend = PricingBackend::CPU;
+        }
+    }
 
-    auto record_pseudocost = [&](const SearchNode& child, double child_bound,
-                                 bool infeasible) {
-        if (child.branch_variable < 0 || child.branch_distance <= 0.0 ||
-            !std::isfinite(child.priority_bound)) {
-            return;
-        }
-        const auto j = static_cast<std::size_t>(child.branch_variable);
-        const double unit_cost = infeasible
-                                     ? kInfinityValue
-                                     : std::max(0.0, child_bound - child.priority_bound) /
-                                           child.branch_distance;
-        if (child.branch_direction < 0) {
-            down_pseudocost[j] += unit_cost;
-            ++down_observations[j];
-        } else {
-            up_pseudocost[j] += unit_cost;
-            ++up_observations[j];
-        }
+    SharedSearchState shared{
+        problem, options, relaxation_options, root_lower, root_upper,
+        has_integer_variables, open, incumbent_state, next_node_order,
+        start, options.time_limit_seconds,
     };
 
-    const auto reliable = [&](std::size_t j) {
-        return down_observations[j] >= options.reliability_threshold &&
-               up_observations[j] >= options.reliability_threshold;
-    };
-    const auto pseudocost_score = [&](const FractionalCandidate& candidate) {
-        const auto j = static_cast<std::size_t>(candidate.variable);
-        if (down_observations[j] == 0 || up_observations[j] == 0) return -1.0;
-        const double down = (down_pseudocost[j] / down_observations[j]) * candidate.fraction;
-        const double up = (up_pseudocost[j] / up_observations[j]) * (1.0 - candidate.fraction);
-        return std::min(down, up);
-    };
+    WorkerContext root_ctx(workspace, static_cast<std::size_t>(problem.n_cols()));
 
-    const auto observe_pseudocost = [&](std::int32_t variable, int direction,
-                                        double unit_cost) {
-        const auto j = static_cast<std::size_t>(variable);
-        if (direction < 0) {
-            down_pseudocost[j] += unit_cost;
-            ++down_observations[j];
-        } else {
-            up_pseudocost[j] += unit_cost;
-            ++up_observations[j];
-        }
-    };
-
-    const auto consider_incumbent = [&](const std::vector<double>& candidate,
-                                        const std::vector<double>& candidate_lower,
-                                        const std::vector<double>& candidate_upper) {
-        if (!feasible_point(problem, candidate, candidate_lower, candidate_upper,
-                            options.feasibility_tolerance, options.lp_options.parallel_mode) ||
-            !integral_point(problem, candidate, options.integrality_tolerance)) {
-            return false;
-        }
-        const double candidate_objective = objective_value(workspace, candidate);
-        if (!std::isfinite(incumbent) ||
-            candidate_objective < incumbent -
-                                     options.objective_tolerance * (1.0 + std::fabs(incumbent))) {
-            incumbent = candidate_objective;
-            incumbent_x = candidate;
-            ++solution.incumbent_updates;
-            return true;
-        }
-        return false;
-    };
-
-    bool heuristic_timeout = false;
-    const auto attempt_lp_dive = [&](const LpSolution& starting,
-                                     const std::vector<double>& starting_lower,
-                                     const std::vector<double>& starting_upper) {
-        if (!options.use_diving_heuristic || options.diving_max_depth == 0 ||
-            options.diving_max_lp_relaxations == 0 || std::isfinite(incumbent)) {
-            return;
-        }
-
-        LpSolution current = starting;
-        std::vector<double> dive_lower = starting_lower;
-        std::vector<double> dive_upper = starting_upper;
-        std::uint32_t dive_relaxations = 0;
-        for (std::uint32_t depth = 0; depth < options.diving_max_depth; ++depth) {
-            if (timed_out()) {
-                heuristic_timeout = true;
-                return;
-            }
-            if (integral_point(problem, current.x, options.integrality_tolerance)) {
-                consider_incumbent(current.x, dive_lower, dive_upper);
-                return;
-            }
-            const auto candidates =
-                fractional_candidates(problem, current.x, options.integrality_tolerance);
-            if (candidates.empty()) return;
-
-            const FractionalCandidate& candidate = candidates.front();
-            const auto j = static_cast<std::size_t>(candidate.variable);
-            const double floor_value = std::floor(current.x[j]);
-            const double ceil_value = std::ceil(current.x[j]);
-            // Prefer the side indicated by the objective, then try the other
-            // side if the preferred LP is infeasible. This is a deterministic
-            // objective-guided dive, not a relaxation bound used for proof.
-            const int preferred_direction = workspace.obj[j] < 0.0 ? +1 : -1;
-            const auto solve_dive_child = [&](int direction) -> bool {
-                std::vector<double> child_lower = dive_lower;
-                std::vector<double> child_upper = dive_upper;
-                if (direction < 0) {
-                    child_upper[j] = std::min(child_upper[j], floor_value);
-                } else {
-                    child_lower[j] = std::max(child_lower[j], ceil_value);
-                }
-                if (!bounds_are_valid(child_lower, child_upper)) return false;
-                workspace.lower = child_lower;
-                workspace.upper = child_upper;
-                ++solution.lp_relaxations;
-                ++solution.diving_heuristic_lp_relaxations;
-                ++dive_relaxations;
-                const LpSolution child = solve_lp(workspace, relaxation_options);
-                workspace.lower = dive_lower;
-                workspace.upper = dive_upper;
-                if (child.status != LpStatus::OPTIMAL ||
-                    child.x.size() != static_cast<std::size_t>(problem.n_cols())) {
-                    return false;
-                }
-                current = child;
-                dive_lower = std::move(child_lower);
-                dive_upper = std::move(child_upper);
-                return true;
-            };
-
-            if (dive_relaxations >= options.diving_max_lp_relaxations ||
-                (!solve_dive_child(preferred_direction) &&
-                 (dive_relaxations >= options.diving_max_lp_relaxations ||
-                  !solve_dive_child(-preferred_direction)))) {
-                return;
-            }
-        }
-        if (integral_point(problem, current.x, options.integrality_tolerance)) {
-            consider_incumbent(current.x, dive_lower, dive_upper);
-        }
-    };
-
-    const auto attempt_local_improvement = [&](const std::vector<double>& node_lower,
-                                               const std::vector<double>& node_upper) {
-        if (!options.use_local_improvement || options.local_improvement_passes == 0 ||
-            options.local_improvement_max_trials == 0 || !std::isfinite(incumbent)) {
-            return;
-        }
-
-        std::vector<double> current = incumbent_x;
-        for (std::uint32_t pass = 0; pass < options.local_improvement_passes; ++pass) {
-            bool improved = false;
-            std::uint32_t trials = 0;
-            for (std::int32_t j = 0; j < problem.n_cols() &&
-                                      trials < options.local_improvement_max_trials;
-                 ++j) {
-                const auto jj = static_cast<std::size_t>(j);
-                if (problem.variable_types[jj] == VariableType::CONTINUOUS) continue;
-                if (!std::isfinite(current[jj])) continue;
-
-                std::vector<double> trial_lower = node_lower;
-                std::vector<double> trial_upper = node_upper;
-                for (std::int32_t k = 0; k < problem.n_cols(); ++k) {
-                    const auto kk = static_cast<std::size_t>(k);
-                    if (problem.variable_types[kk] == VariableType::CONTINUOUS) continue;
-                    const double fixed = std::round(current[kk]);
-                    trial_lower[kk] = std::max(trial_lower[kk], fixed);
-                    trial_upper[kk] = std::min(trial_upper[kk], fixed);
-                }
-
-                const double current_value = std::round(current[jj]);
-                double trial_value = current_value;
-                if (binary_domain(problem, problem.relaxation, j)) {
-                    trial_value = current_value <= 0.5 ? 1.0 : 0.0;
-                } else {
-                    const double up = current_value + 1.0;
-                    const double down = current_value - 1.0;
-                    if (up <= trial_upper[jj]) trial_value = up;
-                    else if (down >= trial_lower[jj]) trial_value = down;
-                    else continue;
-                }
-                trial_lower[jj] = std::max(trial_lower[jj], trial_value);
-                trial_upper[jj] = std::min(trial_upper[jj], trial_value);
-                if (!bounds_are_valid(trial_lower, trial_upper)) continue;
-
-                LpProblem local = workspace;
-                local.lower = trial_lower;
-                local.upper = trial_upper;
-                ++trials;
-                ++solution.lp_relaxations;
-                ++solution.local_improvement_lp_relaxations;
-                const LpSolution local_solution = solve_lp(local, relaxation_options);
-                if (local_solution.status != LpStatus::OPTIMAL ||
-                    local_solution.x.size() != static_cast<std::size_t>(problem.n_cols())) {
-                    continue;
-                }
-                const double before = incumbent;
-                if (consider_incumbent(local_solution.x, node_lower, node_upper) &&
-                    incumbent < before) {
-                    current = incumbent_x;
-                    improved = true;
-                }
-                if (timed_out()) return;
-            }
-            if (!improved) break;
-        }
-    };
-
-    // RENS -- "Relaxation Enforced Neighborhood Search" (Berthold, "RENS --
-    // the optimal rounding", Mathematical Programming Computation 6(1),
-    // 2014). Distinct from both heuristics above: rounding_heuristic snaps
-    // the relaxation's integer columns to their nearest integer with NO
-    // re-solve; attempt_lp_dive fixes ONE fractional variable at a time
-    // with a full LP re-solve per step; RENS instead restricts EVERY
-    // integer-restricted column AT ONCE -- an already-integral one is
-    // FIXED there, a fractional one is bounded to its two nearest integers
-    // {floor, ceil} -- and re-solves the single resulting LP exactly once.
-    // The restricted LP's own feasible region already encodes "close to
-    // the relaxation, but integer-reachable"; unlike a full RENS this does
-    // NOT recurse into a sub-MIP when that one solve is still fractional --
-    // ENGINEERING TECHNIQUE, scoped down deliberately (see docs/
-    // architecture/MILP.md \S4 for why): a single LP solve is cheap and
-    // risk-free to try (a failed/fractional/infeasible result changes
-    // nothing, exactly like every other heuristic here), while a recursive
-    // sub-MIP is materially more machinery for a first increment. Root-only
-    // for the same reason attempt_local_improvement is root-only -- this is
-    // a single-shot heuristic, not a repeated search, so there is nothing
-    // to gain from re-invoking it at every node.
-    const auto attempt_rens = [&](const LpSolution& starting,
-                                  const std::vector<double>& starting_lower,
-                                  const std::vector<double>& starting_upper) {
-        if (!options.use_rens_heuristic) return;
-        if (integral_point(problem, starting.x, options.integrality_tolerance)) return;
-
-        std::vector<double> rens_lower = starting_lower;
-        std::vector<double> rens_upper = starting_upper;
-        for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
-            const auto jj = static_cast<std::size_t>(j);
-            if (problem.variable_types[jj] == VariableType::CONTINUOUS) continue;
-            const double value = starting.x[jj];
-            const double floor_value = std::floor(value);
-            const double ceil_value = std::ceil(value);
-            if (ceil_value - value <= options.integrality_tolerance ||
-                value - floor_value <= options.integrality_tolerance) {
-                const double fixed = std::round(value);
-                rens_lower[jj] = std::max(rens_lower[jj], fixed);
-                rens_upper[jj] = std::min(rens_upper[jj], fixed);
-            } else {
-                rens_lower[jj] = std::max(rens_lower[jj], floor_value);
-                rens_upper[jj] = std::min(rens_upper[jj], ceil_value);
-            }
-        }
-        if (!bounds_are_valid(rens_lower, rens_upper)) return;
-
-        LpProblem restricted = workspace;
-        restricted.lower = std::move(rens_lower);
-        restricted.upper = std::move(rens_upper);
-        ++solution.lp_relaxations;
-        ++solution.rens_heuristic_lp_relaxations;
-        const LpSolution restricted_solution = solve_lp(restricted, relaxation_options);
-        if (restricted_solution.status != LpStatus::OPTIMAL ||
-            restricted_solution.x.size() != static_cast<std::size_t>(problem.n_cols())) {
-            return;
-        }
-        consider_incumbent(restricted_solution.x, starting_lower, starting_upper);
-    };
-
-    while (!open.empty()) {
+    // ---- mandatory serial root phase -------------------------------------
+    // Root's own cuts/RENS/local-improvement are one-shot, root-only
+    // heuristics regardless of parallel_worker_count -- processed here,
+    // single-threaded, exactly as the pre-parallel code always did, before
+    // any worker thread exists. `continue_search` becomes true only when
+    // the root actually branched with no other condition (a limit, a
+    // fatal error) preempting it first.
+    bool continue_search = false;
+    for (;;) {
         if (timed_out()) {
             solution.status = MilpStatus::TIME_LIMIT;
             break;
         }
-        if (options.node_limit > 0 && solution.nodes_processed >= options.node_limit) {
+        if (options.node_limit > 0 && root_ctx.nodes_processed >= options.node_limit) {
             solution.status = MilpStatus::NODE_LIMIT;
             break;
         }
+        const NodeResult result = process_node(shared, root_ctx, root);
+        solution.root_cover_cuts += result.cover_cuts_added;
+        solution.cover_cuts += result.cover_cuts_added;
+        solution.root_gmi_cuts += result.gmi_cuts_added;
+        if (result.outcome == NodeOutcome::Requeue) continue;
+        if (result.outcome == NodeOutcome::TimedOutMidHeuristic) {
+            solution.status = MilpStatus::TIME_LIMIT;
+            break;
+        }
+        if (result.outcome == NodeOutcome::Fatal) {
+            solution.status = result.fatal_status;
+            break;
+        }
+        if (result.outcome == NodeOutcome::Pruned) {
+            // Root itself proved infeasible, or its own integral candidate
+            // was accepted as the incumbent -- either way, nothing is left
+            // to explore.
+            break;
+        }
+        // Branched.
+        open.push_pair(std::move(result.left), std::move(result.right));
+        continue_search = true;
+        break;
+    }
 
-        const auto node = open.top();
-        open.pop();
-        ++solution.nodes_processed;
-
-        std::shared_ptr<const Simplex::Basis> node_parent_basis;
-        if (options.warm_start_node_relaxations) {
-            auto pending_it = pending_basis.find(node->order);
-            if (pending_it != pending_basis.end()) {
-                node_parent_basis = pending_it->second;
-                pending_basis.erase(pending_it);
+    if (continue_search) {
+        if (n_workers <= 1) {
+            // Continue on THIS thread, reusing root_ctx so pseudocosts,
+            // pending_basis, and every counter accumulate exactly as the
+            // pre-parallel single-threaded code always did -- no
+            // std::thread is spawned at all, so parallel_worker_count's
+            // default (1) costs nothing beyond the ConcurrentPriorityQueue's
+            // own mutex, uncontended with a single caller. WorkerCoordinator
+            // with n_workers=1 correctly treats "queue empty" as immediate,
+            // successful termination.
+            WorkerCoordinator solo_coordinator(1);
+            while (true) {
+                auto popped = open.pop_or_wait(solo_coordinator);
+                if (!popped.has_value()) break;
+                if (timed_out()) {
+                    solution.status = MilpStatus::TIME_LIMIT;
+                    break;
+                }
+                if (options.node_limit > 0 && root_ctx.nodes_processed >= options.node_limit) {
+                    solution.status = MilpStatus::NODE_LIMIT;
+                    break;
+                }
+                const NodeResult result = process_node(shared, root_ctx, *popped);
+                if (result.outcome == NodeOutcome::Fatal) {
+                    solution.status = result.fatal_status;
+                    break;
+                }
+                if (result.outcome == NodeOutcome::TimedOutMidHeuristic) {
+                    solution.status = MilpStatus::TIME_LIMIT;
+                    break;
+                }
+                if (result.outcome == NodeOutcome::Branched) {
+                    open.push_pair(std::move(result.left), std::move(result.right));
+                }
             }
-        }
-
-        if (std::isfinite(incumbent) &&
-            node->priority_bound >= incumbent -
-                                         options.objective_tolerance * (1.0 + std::fabs(incumbent))) {
-            ++solution.nodes_pruned;
-            continue;
-        }
-
-        std::vector<double> lower;
-        std::vector<double> upper;
-        materialize_bounds(*node, root_lower, root_upper, lower, upper);
-        if (!bounds_are_valid(lower, upper)) {
-            ++solution.nodes_pruned;
-            continue;
-        }
-        workspace.lower = lower;
-        workspace.upper = upper;
-
-        ++solution.lp_relaxations;
-        LpSolution relaxation;
-        std::shared_ptr<const Simplex::Basis> node_basis;
-        if (node->depth == 0 || !options.warm_start_node_relaxations) {
-            // Root always takes this path: its solve goes through
-            // solve_lp's presolve, and a warm basis is only valid for a
-            // child that solves over the SAME augmented column space --
-            // not guaranteed once presolve's bound-dependent reductions
-            // are in the picture. Every node also takes this path when the
-            // feature is off, which is exactly today's behavior.
-            relaxation = solve_lp(workspace, relaxation_options);
         } else {
-            if (!node_scale_ready) {
-                node_scale = relaxation_options.use_ruiz_scaling
-                                 ? compute_ruiz_scaling(workspace.A)
-                                 : ScaleFactors::identity(workspace.n_rows(), workspace.n_cols());
-                node_scale_ready = true;
+            // Genuine multi-threaded phase: N fresh WorkerContexts (NOT
+            // continuing root_ctx's own pseudocost/pending_basis history --
+            // starting blank is a real, explicitly accepted difference
+            // from single-threaded search that affects tree shape/timing
+            // only, never final-answer correctness; see
+            // docs/architecture/MILP.md's parallel-B&B section).
+            WorkerCoordinator coordinator(n_workers);
+            std::vector<std::unique_ptr<WorkerContext>> contexts;
+            contexts.reserve(n_workers);
+            for (std::uint32_t i = 0; i < n_workers; ++i) {
+                contexts.push_back(std::make_unique<WorkerContext>(
+                    workspace, static_cast<std::size_t>(problem.n_cols())));
             }
-            Simplex simplex(workspace, relaxation_options.backend,
-                             relaxation_options.use_ruiz_scaling, relaxation_options.pricing_rule,
-                             LpAlgorithm::AUTO, relaxation_options.parallel_mode, &node_scale);
-            if (relaxation_options.simplex_time_budget_seconds > 0.0) {
-                simplex.set_time_budget(relaxation_options.simplex_time_budget_seconds);
-            }
-            if (node_parent_basis) simplex.set_warm_start_basis(node_parent_basis.get());
 
-            const LpResult lp = simplex.solve();
-            relaxation.status = lp.status;
-            relaxation.x = lp.x;
-            relaxation.objective_value = lp.objective_value;
+            std::atomic<bool> worker_fatal{false};
+            std::mutex fatal_status_mutex;
+            MilpStatus worker_fatal_status = MilpStatus::NUMERICAL_FAILURE;
+            // Best-effort GLOBAL node count across every worker: exactly
+            // hitting node_limit under concurrency is inherently
+            // approximate (several workers may each process one more node
+            // past it before all notice) -- a real, stated tradeoff, not a
+            // bug (docs/architecture/MILP.md).
+            std::atomic<std::uint64_t> global_nodes_processed{0};
 
-            if (lp.used_warm_start) ++solution.warm_started_relaxations;
-            if (lp.warm_start_attempted && !lp.used_warm_start) {
-                ++solution.warm_start_verification_fallbacks;
-            }
-            if (lp.status == LpStatus::OPTIMAL) {
-                node_basis = std::make_shared<const Simplex::Basis>(simplex.export_basis());
-            }
-        }
-        if (relaxation.status == LpStatus::INFEASIBLE) {
-            record_pseudocost(*node, node->priority_bound, true);
-            ++solution.nodes_pruned;
-            continue;
-        }
-        if (relaxation.status == LpStatus::UNBOUNDED) {
-            relaxation_unbounded = true;
-            solution.status = has_integer_variables ? MilpStatus::UNBOUNDED_RELAXATION
-                                                     : MilpStatus::UNBOUNDED;
-            break;
-        }
-        if (relaxation.status != LpStatus::OPTIMAL ||
-            relaxation.x.size() != static_cast<std::size_t>(problem.n_cols())) {
-            solution.status = MilpStatus::NUMERICAL_FAILURE;
-            break;
-        }
-
-        const double lower_bound = relaxation.objective_value;
-        record_pseudocost(*node, lower_bound, false);
-
-        if (node->depth == 0 && !root_cuts_separated && options.enable_root_cover_cuts) {
-            root_cuts_separated = true;
-            const auto cuts = separate_cover_cuts(
-                problem, relaxation.x, options.cut_violation_tolerance,
-                options.max_root_cover_cuts);
-            if (!cuts.empty()) {
-                append_cover_cuts(workspace, cuts);
-                solution.root_cover_cuts = cuts.size();
-                solution.cover_cuts = cuts.size();
-                open.push(node);
-                continue;
-            }
-        }
-        if (node->depth == 0 && !root_gmi_separated && options.enable_root_gmi_cuts) {
-            root_gmi_separated = true;
-            // A dedicated unscaled solve, bypassing solve_lp's presolve:
-            // Gomory cuts need the tableau (B^-1), which solve_lp does not
-            // expose (its LpSolution carries only status/x/objective), and
-            // presolve's column-space reductions would make a tableau
-            // built there invalid for THIS workspace's own row/column
-            // space. Unscaled so tableau coefficients and nonbasic bounds
-            // are directly in original model units, with no scale-factor
-            // bookkeeping in the cut derivation itself. Root-only, so the
-            // extra LP solve is a bounded, one-time cost, counted honestly
-            // below rather than hidden from lp_relaxations.
-            Simplex gmi_simplex(workspace, PricingBackend::CPU, /*use_ruiz_scaling=*/false,
-                                relaxation_options.pricing_rule, LpAlgorithm::AUTO,
-                                relaxation_options.parallel_mode);
-            ++solution.lp_relaxations;
-            const LpResult gmi_lp = gmi_simplex.solve();
-            if (gmi_lp.status == LpStatus::OPTIMAL &&
-                gmi_lp.x.size() == static_cast<std::size_t>(problem.n_cols())) {
-                const auto cuts =
-                    separate_gmi_cuts(problem, workspace, gmi_simplex, gmi_lp.x,
-                                      options.cut_violation_tolerance, options.max_root_gmi_cuts);
-                if (!cuts.empty()) {
-                    append_general_cuts(workspace, cuts);
-                    solution.root_gmi_cuts = cuts.size();
-                    open.push(node);
-                    continue;
-                }
-            }
-        }
-        if (std::isfinite(incumbent) &&
-            lower_bound >= incumbent -
-                               options.objective_tolerance * (1.0 + std::fabs(incumbent))) {
-            ++solution.nodes_pruned;
-            continue;
-        }
-
-        const bool candidate_integral =
-            integral_point(problem, relaxation.x, options.integrality_tolerance);
-        const std::vector<double> rounded = rounded_point(problem, relaxation.x, lower, upper);
-        if (candidate_integral || options.use_rounding_heuristic) {
-            const bool accepted = consider_incumbent(rounded, lower, upper);
-            if (!accepted && candidate_integral) {
-                // The LP claimed an integral point, but the exact integer
-                // candidate did not clear the original-model gate. Do not
-                // branch on a point that should already be terminal: this is
-                // a numerical inconsistency, not proof of infeasibility.
-                solution.status = MilpStatus::NUMERICAL_FAILURE;
-                break;
-            }
-        }
-
-        if (candidate_integral) continue;
-
-        // RENS first: one cheap LP solve, tried before the (potentially
-        // many-solve) dive below so a successful RENS candidate lets the
-        // dive's own `!isfinite(incumbent)` guard skip it entirely.
-        if (node->depth == 0) {
-            attempt_rens(relaxation, lower, upper);
-            if (timed_out()) {
-                open.push(node);
-                solution.status = MilpStatus::TIME_LIMIT;
-                break;
-            }
-        }
-
-        // Dive at the root and at only the first few levels when no
-        // incumbent exists. Repeating a failed dive at every deep node can
-        // spend more LP work on heuristics than on certified search.
-        if (node->depth <= 2 && !std::isfinite(incumbent)) {
-            attempt_lp_dive(relaxation, lower, upper);
-            if (heuristic_timeout) {
-                open.push(node);
-                solution.status = MilpStatus::TIME_LIMIT;
-                break;
-            }
-        }
-        if (node->depth == 0 && std::isfinite(incumbent)) {
-            attempt_local_improvement(lower, upper);
-            if (timed_out()) {
-                open.push(node);
-                solution.status = MilpStatus::TIME_LIMIT;
-                break;
-            }
-        }
-
-        for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
-            const auto jx = static_cast<std::size_t>(j);
-            if (problem.variable_types[jx] != VariableType::CONTINUOUS &&
-                !std::isfinite(relaxation.x[jx])) {
-                solution.status = MilpStatus::NUMERICAL_FAILURE;
-                break;
-            }
-        }
-        if (solution.status == MilpStatus::NUMERICAL_FAILURE) {
-            break;
-        }
-
-        const std::vector<FractionalCandidate> candidates =
-            fractional_candidates(problem, relaxation.x, options.integrality_tolerance);
-        if (candidates.empty()) {
-            solution.status = MilpStatus::NUMERICAL_FAILURE;
-            break;
-        }
-
-        std::int32_t branch_variable = candidates.front().variable;
-        if (options.branching_rule == MilpBranchingRule::PSEUDOCOST ||
-            options.branching_rule == MilpBranchingRule::RELIABILITY) {
-            if (options.branching_rule == MilpBranchingRule::RELIABILITY) {
-                std::uint32_t probes = 0;
-                for (const FractionalCandidate& candidate : candidates) {
-                    const auto j = static_cast<std::size_t>(candidate.variable);
-                    if (reliable(j)) continue;
-                    if (probes >= options.strong_branching_candidates) break;
-                    if (timed_out()) {
-                        open.push(node);
-                        solution.status = MilpStatus::TIME_LIMIT;
-                        break;
+            const auto worker_loop = [&](std::uint32_t worker_index) {
+                WorkerContext& ctx = *contexts[worker_index];
+                while (true) {
+                    auto popped = open.pop_or_wait(coordinator);
+                    if (!popped.has_value()) return;
+                    if (timed_out() ||
+                        (options.node_limit > 0 &&
+                         global_nodes_processed.load(std::memory_order_relaxed) >=
+                             options.node_limit)) {
+                        open.request_stop(coordinator);
+                        return;
                     }
-
-                    const double floor_probe = std::floor(relaxation.x[j]);
-                    const double ceil_probe = std::ceil(relaxation.x[j]);
-                    const double down_distance = candidate.fraction;
-                    const double up_distance = 1.0 - candidate.fraction;
-
-                    auto probe_child = [&](int direction, double bound,
-                                           double distance) -> std::pair<bool, double> {
-                        std::vector<double> probe_lower = lower;
-                        std::vector<double> probe_upper = upper;
-                        if (direction < 0) {
-                            probe_upper[j] = std::min(probe_upper[j], bound);
-                        } else {
-                            probe_lower[j] = std::max(probe_lower[j], bound);
+                    const NodeResult result = process_node(shared, ctx, *popped);
+                    global_nodes_processed.fetch_add(1, std::memory_order_relaxed);
+                    if (result.outcome == NodeOutcome::Fatal ||
+                        result.outcome == NodeOutcome::TimedOutMidHeuristic) {
+                        bool expected = false;
+                        if (worker_fatal.compare_exchange_strong(expected, true)) {
+                            std::lock_guard<std::mutex> lock(fatal_status_mutex);
+                            worker_fatal_status =
+                                result.outcome == NodeOutcome::TimedOutMidHeuristic
+                                    ? MilpStatus::TIME_LIMIT
+                                    : result.fatal_status;
                         }
-                        if (!bounds_are_valid(probe_lower, probe_upper)) {
-                            return {true, kInfinityValue};
-                        }
-                        workspace.lower = probe_lower;
-                        workspace.upper = probe_upper;
-                        ++solution.lp_relaxations;
-                        ++solution.strong_branching_probes;
-                        const LpSolution probe = solve_lp(workspace, relaxation_options);
-                        workspace.lower = lower;
-                        workspace.upper = upper;
-                        if (probe.status == LpStatus::INFEASIBLE) {
-                            return {true, kInfinityValue};
-                        }
-                        if (probe.status != LpStatus::OPTIMAL || distance <= 0.0) {
-                            return {false, 0.0};
-                        }
-                        return {true, std::max(0.0, probe.objective_value - lower_bound) /
-                                            distance};
-                    };
-
-                    const auto down_probe = probe_child(-1, floor_probe, down_distance);
-                    const auto up_probe = probe_child(+1, ceil_probe, up_distance);
-                    if (down_probe.first) {
-                        observe_pseudocost(candidate.variable, -1, down_probe.second);
+                        open.request_stop(coordinator);
+                        return;
                     }
-                    if (up_probe.first) {
-                        observe_pseudocost(candidate.variable, +1, up_probe.second);
+                    if (result.outcome == NodeOutcome::Branched) {
+                        open.push_pair(std::move(result.left), std::move(result.right));
                     }
-                    ++probes;
+                    // Pruned/Requeue: Requeue structurally never happens
+                    // here (root-only cut separation self-gates on
+                    // depth == 0, and the root never reaches a worker).
                 }
-                if (solution.status == MilpStatus::TIME_LIMIT) break;
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(n_workers);
+            for (std::uint32_t i = 0; i < n_workers; ++i) {
+                workers.emplace_back(worker_loop, i);
+            }
+            for (auto& t : workers) t.join();
+
+            for (auto& ctx : contexts) {
+                solution.nodes_processed += ctx->nodes_processed;
+                solution.nodes_pruned += ctx->nodes_pruned;
+                solution.lp_relaxations += ctx->lp_relaxations;
+                solution.strong_branching_probes += ctx->strong_branching_probes;
+                solution.warm_started_relaxations += ctx->warm_started_relaxations;
+                solution.warm_start_verification_fallbacks += ctx->warm_start_verification_fallbacks;
+                solution.diving_heuristic_lp_relaxations += ctx->diving_heuristic_lp_relaxations;
+                solution.local_improvement_lp_relaxations += ctx->local_improvement_lp_relaxations;
+                solution.rens_heuristic_lp_relaxations += ctx->rens_heuristic_lp_relaxations;
             }
 
-            double best_score = -1.0;
-            for (const FractionalCandidate& candidate : candidates) {
-                const auto j = static_cast<std::size_t>(candidate.variable);
-                if (options.branching_rule == MilpBranchingRule::RELIABILITY &&
-                    !reliable(j)) {
-                    continue;
-                }
-                const double score = pseudocost_score(candidate);
-                if (score > best_score) {
-                    best_score = score;
-                    branch_variable = candidate.variable;
-                }
+            if (worker_fatal.load()) {
+                solution.status = worker_fatal_status;
+            } else if (timed_out()) {
+                solution.status = MilpStatus::TIME_LIMIT;
+            } else if (options.node_limit > 0 &&
+                       global_nodes_processed.load(std::memory_order_relaxed) >= options.node_limit) {
+                solution.status = MilpStatus::NODE_LIMIT;
             }
         }
-
-        const auto jj = static_cast<std::size_t>(branch_variable);
-        const double floor_value = std::floor(relaxation.x[jj]);
-        const double ceil_value = std::ceil(relaxation.x[jj]);
-        if (floor_value >= ceil_value || !std::isfinite(floor_value) ||
-            !std::isfinite(ceil_value)) {
-            solution.status = MilpStatus::NUMERICAL_FAILURE;
-            break;
-        }
-
-        auto left = std::make_shared<SearchNode>();
-        left->parent = node;
-        left->depth = node->depth + 1;
-        left->order = next_node_order++;
-        left->priority_bound = lower_bound;
-        left->change.variable = branch_variable;
-        left->change.upper = floor_value;
-        left->branch_variable = branch_variable;
-        left->branch_direction = -1;
-        left->branch_distance = relaxation.x[jj] - floor_value;
-
-        auto right = std::make_shared<SearchNode>();
-        right->parent = node;
-        right->depth = node->depth + 1;
-        right->order = next_node_order++;
-        right->priority_bound = lower_bound;
-        right->change.variable = branch_variable;
-        right->change.lower = ceil_value;
-        right->branch_variable = branch_variable;
-        right->branch_direction = +1;
-        right->branch_distance = ceil_value - relaxation.x[jj];
-
-        if (node_basis) {
-            // Same shared_ptr, refcounted rather than duplicated -- both
-            // children start from the same parent basis, one bound-change
-            // delta apart from it in opposite directions.
-            pending_basis.emplace(left->order, node_basis);
-            pending_basis.emplace(right->order, node_basis);
-        }
-
-        open.push(std::move(left));
-        open.push(std::move(right));
     }
 
-    solution.has_incumbent = std::isfinite(incumbent);
+    // Merge the root phase's own counters exactly once, regardless of
+    // which path above ran (single-threaded continuation reuses root_ctx
+    // directly for everything after the root too, so this still correctly
+    // captures the WHOLE search's work in that case).
+    solution.nodes_processed += root_ctx.nodes_processed;
+    solution.nodes_pruned += root_ctx.nodes_pruned;
+    solution.lp_relaxations += root_ctx.lp_relaxations;
+    solution.strong_branching_probes += root_ctx.strong_branching_probes;
+    solution.warm_started_relaxations += root_ctx.warm_started_relaxations;
+    solution.warm_start_verification_fallbacks += root_ctx.warm_start_verification_fallbacks;
+    solution.diving_heuristic_lp_relaxations += root_ctx.diving_heuristic_lp_relaxations;
+    solution.local_improvement_lp_relaxations += root_ctx.local_improvement_lp_relaxations;
+    solution.rens_heuristic_lp_relaxations += root_ctx.rens_heuristic_lp_relaxations;
+
+    solution.has_incumbent =
+        std::isfinite(incumbent_state.objective.load(std::memory_order_acquire));
     if (solution.has_incumbent) {
-        solution.x = std::move(incumbent_x);
-        solution.objective_value = problem.maximize ? -incumbent : incumbent;
+        std::lock_guard<std::mutex> lock(incumbent_state.mutex);
+        solution.x = incumbent_state.x;
+        solution.objective_value = problem.maximize
+                                        ? -incumbent_state.objective.load(std::memory_order_relaxed)
+                                        : incumbent_state.objective.load(std::memory_order_relaxed);
     }
-    const double minimization_bound = current_best_bound(open, solution.has_incumbent, incumbent);
+    const double minimization_incumbent = incumbent_state.objective.load(std::memory_order_acquire);
+    const double minimization_bound =
+        current_best_bound(open, solution.has_incumbent, minimization_incumbent);
     solution.best_bound = problem.maximize ? -minimization_bound : minimization_bound;
-    solution.relative_gap = relative_gap(solution.has_incumbent, incumbent, minimization_bound);
+    solution.relative_gap =
+        relative_gap(solution.has_incumbent, minimization_incumbent, minimization_bound);
 
-    if (relaxation_unbounded) return solution;
+    if (solution.status == MilpStatus::UNBOUNDED ||
+        solution.status == MilpStatus::UNBOUNDED_RELAXATION) {
+        return solution;
+    }
     if (solution.status == MilpStatus::TIME_LIMIT || solution.status == MilpStatus::NODE_LIMIT ||
         solution.status == MilpStatus::NUMERICAL_FAILURE) {
         return solution;
     }
-    if (open.empty()) {
+    if (open.size_unsafe() == 0) {
         solution.status = solution.has_incumbent ? MilpStatus::OPTIMAL : MilpStatus::INFEASIBLE;
     } else {
         solution.status = MilpStatus::NUMERICAL_FAILURE;

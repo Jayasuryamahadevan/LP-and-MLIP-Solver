@@ -27,7 +27,7 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
-| unit tests | 161 / 161 | `ctest` (145 as of the FTRAN/Markowitz-AMD work + 7 integer-bound-rounding + 3 RENS wiring/non-corruption + 6 doubleton-substitution cases) |
+| unit tests | 165 / 165 | `ctest` (161 as of doubleton substitution + 4 parallel-B&B correctness/determinism cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -303,6 +303,40 @@ numerical hazards with no cleanup implemented yet. `KNOWN LIMITATION`,
 default off (`MilpSolverOptions::enable_root_gmi_cuts = false`), exactly
 the same KPI-gate discipline already applied to warm-started node
 relaxations below. Full account in `docs/architecture/MILP.md` §2.2.
+
+**Parallel (multi-threaded CPU) branch-and-bound** (`src/milp/ParallelSearch.hpp`,
+`MilpSolverOptions::parallel_worker_count`, `docs/architecture/MILP.md` §6) —
+built directly against the node-throughput gap underlying the KNOWN
+LIMITATION above: Gurobi explores `pk1` at ~35,000 nodes/second against this
+project's few-thousand single-threaded. `IMPLEMENTED`, `MEASURED`. A shared
+best-bound priority queue feeds a fixed worker-thread pool; the root is
+always processed sequentially before any worker exists (avoids a real
+cut-separation-requeue race, not a hypothetical one); every worker owns an
+exclusive LP workspace, pseudocost set, and warm-start cache; the incumbent
+uses a lock-free fast-reject atomic plus a mutex-guarded compare-and-update.
+Node exploration order and count are inherently nondeterministic above 1
+worker, but this differs from the earlier `pilot87`-class LP-parallelism
+hazard in kind, not just degree: every per-node relaxation is forced to
+`ParallelMode::SERIAL`, so no OpenMP summation-order perturbation is possible
+inside a node, and B&B's own pruning/incumbent-acceptance invariants do not
+depend on processing order — only branching *choice* does, which affects
+tree shape and timing, never the validity of the final answer. First-ever
+`ThreadSanitizer` run on this codebase (`SIHPS_ENABLE_TSAN`, new CMake
+option) reported 47 warnings, individually traced and confirmed to be a
+well-known GCC-libgomp/TSan false-positive class in **pre-existing** OpenMP
+code (`CSRMatrix::multiply`, `Simplex.cpp`, `Presolve.cpp`) — zero warnings
+name any symbol from the new worker-thread code. **MEASURED** on the same
+5-instance set, single process, 60 s/instance, `parallel_worker_count=1` vs.
+`auto` (4 workers on this 16-core machine): average **3.48x** node-throughput
+speedup across the four time-limited instances (~87% parallel efficiency),
+identical final status on every instance (no solvability regression), and
+`pk1`'s own gap to Gurobi's per-node throughput narrows from ~22x to ~4.7x —
+real, measured progress, explicitly **not** a claim of closing the gap.
+`markshare2`'s gap (99.57%) is unchanged, as expected: that instance's
+difficulty is a weak LP relaxation, which additional node throughput alone
+cannot fix. Full account, including the corrected-in-place prediction about
+which instance would benefit least (it was `markshare2`; measured, it
+benefited most), in `docs/architecture/MILP.md` §6.
 
 `ENGINEERING DECISION` (historical): branch-and-bound was intentionally not
 built in this document's original pass because the benchmark set in question
@@ -614,6 +648,19 @@ benchmark-ready, which is now the top item below.
    RENS and GMI-cuts precedents. General aggregation/probing (the
    fill-in-capable case) remains unimplemented and is not currently the
    top item given this result.
+10. ~~Parallel (multi-threaded CPU) branch-and-bound~~ — **done, MEASURED,
+    real win, on by default is NOT yet recommended** (`parallel_worker_count`
+    defaults to `1`, matching every other opt-in reduction's convention until
+    a longer soak — more instance sizes, longer time budgets — builds
+    confidence). 3.48x average node-throughput speedup at 4 workers across
+    the 5-instance set's time-limited cases, ~87% parallel efficiency, zero
+    solvability regression, first-ever `ThreadSanitizer` run on this codebase
+    clean of any warning attributable to the new code (47 pre-existing,
+    unrelated GCC-libgomp/TSan false positives found and individually traced
+    as a side effect, not swept aside). Unlike items 7-9 above, this is not a
+    null result — it is this session's first MILP-side change that actually
+    moves a benchmark KPI in the intended direction. Full account in
+    `docs/architecture/MILP.md` §6.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

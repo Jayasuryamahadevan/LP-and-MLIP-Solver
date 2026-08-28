@@ -16,6 +16,7 @@ add_executable(sihps_tests
   lp/test_simplex.cpp
   lp/test_adversarial.cpp
   milp/test_milp.cpp
+  milp/test_milp_parallel.cpp
 )
 
 target_link_libraries(sihps_tests PRIVATE sihps_core)
@@ -24,3 +25,12 @@ target_compile_definitions(sihps_tests PRIVATE SIHPS_PROJECT_ROOT="${CMAKE_SOURC
 sihps_set_warnings(sihps_tests)
 
 add_test(NAME sihps_unit_tests COMMAND sihps_tests)
+
+if(SIHPS_ENABLE_TSAN)
+  # Scoped, investigated suppression for a known ThreadSanitizer +
+  # GCC-libgomp limitation, not a blanket silencer -- see
+  # tools/tsan_suppressions.txt and docs/architecture/MILP.md section 6.4
+  # for the stack-trace evidence behind this specific entry.
+  set_tests_properties(sihps_unit_tests PROPERTIES
+    ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tools/tsan_suppressions.txt:halt_on_error=0:history_size=7")
+endif()

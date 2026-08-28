@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <cmath>
 #include <filesystem>
@@ -91,6 +92,13 @@ int main(int argc, char** argv) {
     // option's own default, so a plain invocation reproduces the existing
     // baseline exactly.
     const bool rens_heuristic = argc > 9 && std::string(argv[9]) == "on";
+    // MilpSolverOptions::parallel_worker_count: 1 (default) reproduces
+    // today's single-threaded search exactly. argv[10]: an integer worker
+    // count, or "auto" for 0 (min(4, hardware_concurrency)).
+    const std::uint32_t parallel_workers =
+        argc > 10 ? (std::string(argv[10]) == "auto" ? 0u
+                                                       : static_cast<std::uint32_t>(std::stoul(argv[10])))
+                   : 1u;
 
     std::cout << std::unitbuf;
 
@@ -117,6 +125,7 @@ int main(int argc, char** argv) {
               << " gmi_cuts=" << (gmi_cuts ? "on" : "off")
               << " integer_bound_rounding=" << (integer_bound_rounding ? "on" : "off")
               << " rens_heuristic=" << (rens_heuristic ? "on" : "off")
+              << " parallel_workers=" << parallel_workers
               << " gpu_available=" << (process_start.gpu_available ? "yes" : "no") << '\n';
     std::cout << std::left << std::setw(18) << "instance" << std::right << std::setw(12)
               << "status" << std::setw(18) << "ours" << std::setw(18) << "reference"
@@ -149,6 +158,7 @@ int main(int argc, char** argv) {
             options.enable_root_gmi_cuts = gmi_cuts;
             options.enable_integer_bound_rounding = integer_bound_rounding;
             options.use_rens_heuristic = rens_heuristic;
+            options.parallel_worker_count = parallel_workers;
             if (branching_rule == "most") {
                 options.branching_rule = sihps::MilpBranchingRule::MOST_FRACTIONAL;
             } else if (branching_rule == "pseudocost") {

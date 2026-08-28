@@ -1,4 +1,5 @@
 build/
+build-tsan/
 Highs.log
 
 # Third-party reference solvers pulled for benchmarking only (see

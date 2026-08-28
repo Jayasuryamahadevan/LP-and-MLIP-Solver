@@ -109,6 +109,37 @@ struct MilpSolverOptions {
     // start (the root solve goes through solve_lp's presolve, which a
     // warm basis is not guaranteed to remain valid under).
     bool warm_start_node_relaxations = false;
+
+    // Parallel branch-and-bound (src/milp/ParallelSearch.hpp,
+    // docs/architecture/MILP.md's parallel-B&B section): the root node is
+    // always processed serially (its cuts/RENS/local-improvement are
+    // root-only heuristics regardless of this setting); every node after
+    // that is pulled from a shared best-bound queue by a fixed pool of
+    // worker threads, each solving its own node's LP relaxation with
+    // LpSolverOptions::parallel_mode forced to SERIAL (avoiding
+    // oversubscription against this outer, node-level parallelism -- see
+    // ParallelMode's own doc comment, which already anticipates exactly
+    // this scenario: "use SERIAL when the caller parallelizes independent
+    // domains/subproblems"). Tree control (node selection, branching,
+    // incumbent management, pruning) stays entirely CPU-resident, matching
+    // this project's own architecture rule; no GPU pricing backend is
+    // permitted for any worker when this is > 1 (GPU pricing under
+    // concurrent host threads has not been verified safe and is out of
+    // scope for this increment).
+    //
+    // 1 (default) reproduces today's single-threaded search exactly --
+    // this project's own standing rule that a new lever ships off by
+    // default until MEASURED to help (enable_root_gmi_cuts,
+    // use_rens_heuristic, warm_start_node_relaxations above all follow the
+    // same pattern). 0 means "auto": min(4, hardware_concurrency).
+    //
+    // Node exploration ORDER and node COUNT become inherently
+    // nondeterministic above 1 (thread-scheduling-dependent) -- a real,
+    // stated tradeoff, not a bug: the FINAL reported answer (status,
+    // objective, feasibility of x against the original model) does not
+    // depend on processing order, only its timing does (full argument in
+    // docs/architecture/MILP.md).
+    std::uint32_t parallel_worker_count = 1;
 };
 
 struct MilpSolution {

@@ -28,7 +28,7 @@ add_library(sihps_core STATIC
 
 target_include_directories(sihps_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(sihps_core PUBLIC cxx_std_17)
-target_link_libraries(sihps_core PUBLIC CUDA::cudart CUDA::cusparse)
+target_link_libraries(sihps_core PUBLIC CUDA::cudart CUDA::cusparse Threads::Threads)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(sihps_core PUBLIC OpenMP::OpenMP_CXX)
 endif()

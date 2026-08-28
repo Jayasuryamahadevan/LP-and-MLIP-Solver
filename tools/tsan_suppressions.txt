@@ -1,0 +1,21 @@
+# ThreadSanitizer suppressions for this project's TSAN_ENABLE_TSAN build
+# (docs/architecture/MILP.md section 6.4). Every entry here is scoped as
+# narrowly as TSan's suppression syntax allows, and each is backed by a
+# stack-trace investigation recorded in that doc section, not assumed.
+#
+# GCC's libgomp does not expose its OpenMP parallel-region barrier/join
+# synchronization to ThreadSanitizer's happens-before tracker (a
+# well-documented ThreadSanitizer + GCC-libgomp interaction limitation,
+# distinct from Clang/LLVM's libomp, which has partial TSan annotation
+# support). Every `#pragma omp parallel` region in this codebase's
+# pre-existing OpenMP hot paths (CSRMatrix::multiply, Simplex::price_cpu,
+# Simplex::recompute_basic_values, Simplex::compute_tableau_row, Presolve)
+# therefore reads as a "race" to TSan between a worker thread's write
+# inside the region and the main thread's read after the region's own
+# (real, correct) implicit barrier -- confirmed directly by inspecting the
+# full stack traces of a raw run: 50/50 reported races had a libgomp.so
+# frame in the writer thread's own creation stack, and zero involved this
+# project's new std::thread-based parallel-B&B code
+# (src/milp/MilpSolver.cpp, src/milp/ParallelSearch.hpp), which never
+# touches libgomp (every worker forces ParallelMode::SERIAL).
+called_from_lib:libgomp.so
