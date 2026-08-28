@@ -23,6 +23,7 @@ add_library(sihps_core STATIC
   lp/Scaling.cpp
   lp/Simplex.cpp
   milp/MilpProblem.cpp
+  milp/ExactBinarySplit.cpp
   milp/MilpSolver.cpp
 )
 

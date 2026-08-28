@@ -1,6 +1,7 @@
 #include "MilpSolver.hpp"
 
 #include "../parallel/Parallel.hpp"
+#include "ExactBinarySplit.hpp"
 #include "ParallelSearch.hpp"
 
 #include <algorithm>
@@ -24,6 +25,26 @@ namespace {
 
 constexpr double kInfinityValue = std::numeric_limits<double>::infinity();
 
+// Genuine floating-point cancellation noise on a row scales with that row's
+// own component-wise term magnitude (|A|*|x|), but by an amount tied to
+// machine precision, not to `feasibility_tolerance` (1e-6) -- MEASURED
+// directly on Netlib `shell`/`perold`: their legitimate solver rounding
+// noise, across dozens of affected rows each, lands at a strikingly
+// consistent ratio of ~5e-10 relative to the row's own |A|*|x| activity
+// (never above 7e-10 in either instance). A genuine infeasibility, by
+// contrast, is not bounded by machine precision at all -- MEASURED on
+// MIPLIB `ej` (a deliberately adversarial "numerics" instance, per its own
+// MIPLIB tag): an incumbent that violates its single equality row by a
+// real 20 units, against a row activity of ~2.05e7, is a ratio of ~9.8e-7,
+// nearly 2000x above the noise ceiling above. `kActivityNoiseRatio` sits
+// in between on a log scale (~20x above the measured noise ceiling, ~100x
+// below the measured violation ratio) -- comfortable margin either way,
+// not a value cut exactly at the boundary of the two measurements it is
+// derived from. Used ADDITIVELY with `feasibility_tolerance`, not as a
+// replacement multiplier: near-zero-activity rows still get exactly
+// `feasibility_tolerance`'s own original, unweakened absolute allowance.
+constexpr double kActivityNoiseRatio = 1e-8;
+
 struct BoundChange {
     std::int32_t variable = -1;
     double lower = -kInfinityValue;
@@ -45,6 +66,19 @@ struct SearchNode {
     // A parent's LP lower bound is also a valid lower bound for either child.
     // It is used for best-bound ordering before the child relaxation is run.
     double priority_bound = -kInfinityValue;
+
+    // The parent's own terminal basis, for warm-starting this node's
+    // relaxation (only set when warm_start_node_relaxations is on). Carried
+    // on the node itself -- rather than in a side map keyed by node order --
+    // because under parallel search a node's two children go into the
+    // SHARED cross-worker queue and are very often popped by a DIFFERENT
+    // worker than the one that created them (see docs/architecture/MILP.md's
+    // parallel-B&B section on the shared-queue design). A side map keyed by
+    // order and stored per-WorkerContext would leave most entries inserted
+    // by the creating worker permanently unconsumed by whichever worker
+    // actually pops the node -- an unbounded leak that scales with total
+    // node count, not a mere warm-start-hit-rate degradation.
+    std::shared_ptr<const Simplex::Basis> parent_basis;
 };
 
 struct NodeCompare {
@@ -120,17 +154,40 @@ bool feasible_point(const MilpProblem& problem, const std::vector<double>& x,
 
     std::vector<double> ax(static_cast<std::size_t>(lp.n_rows()), 0.0);
     if (lp.n_rows() > 0) lp.A.multiply(x.data(), ax.data(), parallel_mode);
-    double rhs_norm = 0.0;
-    for (double value : lp.rhs) rhs_norm = std::max(rhs_norm, std::fabs(value));
-    double row_violation = 0.0;
+    // PER-ROW relative violation, scaled by that row's own component-wise
+    // term magnitude (|A|*|x| -- Higham's standard scaled-residual
+    // denominator, "Accuracy and Stability of Numerical Algorithms" \S7.1),
+    // not a single violation normalized by the model-wide max |rhs|. A
+    // shared global norm lets one large-RHS row (e.g. a plant-wide cost
+    // cap) silently inflate the effective absolute tolerance for every
+    // other row in the SAME model -- MEASURED to let a genuinely violated
+    // equality row (violation ~0.1-0.7, terms of magnitude O(10-100)) pass
+    // as "feasible" on MIPLIB's `flugplinf`, because an unrelated row's
+    // RHS of 1.2e6 pushed the shared denominator that high. But the row's
+    // OWN |rhs| alone is not the right per-row scale either: a row can have
+    // rhs=0 while still summing large-magnitude cancelling terms (measured
+    // on Netlib `shell`/`perold`, where legitimate solver rounding noise
+    // on exactly such rows was wrongly flagged once scaled by |rhs| alone,
+    // since |rhs|=0 gives no headroom for the cancellation that produced
+    // it). Summing |coefficient * x| over the row's own nonzeros gives the
+    // magnitude of what was actually being cancelled, which is the
+    // quantity a rounding-error argument is properly relative to.
+    const auto* row_ptr = lp.A.row_ptr();
+    const auto* col_idx = lp.A.col_idx();
+    const auto* values = lp.A.values();
     for (std::int32_t i = 0; i < lp.n_rows(); ++i) {
         const auto ii = static_cast<std::size_t>(i);
+        double abs_activity = std::fabs(lp.rhs[ii]);
+        for (std::int32_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+            abs_activity += std::fabs(values[k]) * std::fabs(x[static_cast<std::size_t>(col_idx[k])]);
+        }
+        const double allowed = feasibility_tolerance + kActivityNoiseRatio * abs_activity;
         const double lo = lp.rhs[ii] - lp.slack_upper[ii];
         const double hi = lp.rhs[ii] - lp.slack_lower[ii];
-        if (std::isfinite(lo)) row_violation = std::max(row_violation, lo - ax[ii]);
-        if (std::isfinite(hi)) row_violation = std::max(row_violation, ax[ii] - hi);
+        if (std::isfinite(lo) && lo - ax[ii] > allowed) return false;
+        if (std::isfinite(hi) && ax[ii] - hi > allowed) return false;
     }
-    return std::max(0.0, row_violation) / (1.0 + rhs_norm) <= feasibility_tolerance;
+    return true;
 }
 
 bool integral_point(const MilpProblem& problem, const std::vector<double>& x,
@@ -750,6 +807,15 @@ struct SharedSearchState {
     bool root_cuts_separated = false;
     bool root_gmi_separated = false;
 
+    // Live count behind MilpSolverOptions::max_live_warm_start_bases. Held
+    // by shared_ptr, not as a plain member, because each retained basis's
+    // deleter must decrement it: a node (and therefore its basis) can in
+    // principle outlive this struct during teardown, and capturing a
+    // shared_ptr copy makes that ordering irrelevant rather than merely
+    // unlikely.
+    std::shared_ptr<std::atomic<std::uint64_t>> live_parent_bases =
+        std::make_shared<std::atomic<std::uint64_t>>(0);
+
     bool timed_out() const {
         return time_limit_seconds > 0.0 &&
                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
@@ -1007,14 +1073,7 @@ NodeResult process_node(SharedSearchState& shared, WorkerContext& ctx, const Sha
     NodeResult result;
     ++ctx.nodes_processed;
 
-    std::shared_ptr<const Simplex::Basis> node_parent_basis;
-    if (options.warm_start_node_relaxations) {
-        auto pending_it = ctx.pending_basis.find(node->order);
-        if (pending_it != ctx.pending_basis.end()) {
-            node_parent_basis = pending_it->second;
-            ctx.pending_basis.erase(pending_it);
-        }
-    }
+    const std::shared_ptr<const Simplex::Basis>& node_parent_basis = node->parent_basis;
 
     if (has_incumbent() &&
         node->priority_bound >=
@@ -1064,7 +1123,23 @@ NodeResult process_node(SharedSearchState& shared, WorkerContext& ctx, const Sha
             ++ctx.warm_start_verification_fallbacks;
         }
         if (lp.status == LpStatus::OPTIMAL) {
-            node_basis = std::make_shared<const Simplex::Basis>(simplex.export_basis());
+            // Retain this basis for the children only while the live-basis
+            // budget allows (MilpSolverOptions::max_live_warm_start_bases).
+            // Past the cap the children simply warm-start from nothing and
+            // take the already-tested cold path -- a speed degradation
+            // under memory pressure, never a change to pruning or to the
+            // certified answer.
+            const std::uint64_t cap = options.max_live_warm_start_bases;
+            auto& live = *shared.live_parent_bases;
+            if (cap == 0 || live.load(std::memory_order_relaxed) < cap) {
+                live.fetch_add(1, std::memory_order_relaxed);
+                node_basis = std::shared_ptr<const Simplex::Basis>(
+                    new Simplex::Basis(simplex.export_basis()),
+                    [counter = shared.live_parent_bases](const Simplex::Basis* b) {
+                        counter->fetch_sub(1, std::memory_order_relaxed);
+                        delete b;
+                    });
+            }
         }
     }
 
@@ -1134,7 +1209,24 @@ NodeResult process_node(SharedSearchState& shared, WorkerContext& ctx, const Sha
         integral_point(problem, relaxation.x, options.integrality_tolerance);
     const std::vector<double> rounded = rounded_point(problem, relaxation.x, lower, upper);
     if (candidate_integral || options.use_rounding_heuristic) {
-        const bool accepted = consider_incumbent(rounded, lower, upper);
+        bool accepted = consider_incumbent(rounded, lower, upper);
+        if (!accepted && candidate_integral) {
+            // `rounded` snaps every already-near-integral column to its
+            // exact nearest integer. For a row with large coefficients
+            // (MEASURED on MIPLIB `ej`: up to ~51015), even a per-column
+            // shift within `integrality_tolerance` can move that row's Ax
+            // by an amount comparable to -- or exceeding -- the feasibility
+            // gate's own noise budget, even though `relaxation.x` itself
+            // (unrounded) was already certified OPTIMAL/feasible by Simplex
+            // using the identical scaled-residual formula
+            // (Simplex.cpp::finalize_result). Retry with the RAW,
+            // already-certified point before treating this as a fatal,
+            // search-aborting failure -- `candidate_integral` was computed
+            // against `relaxation.x` itself, so it is exactly as
+            // "integral enough" as the rounded version, just without the
+            // rounding-induced perturbation.
+            accepted = consider_incumbent(relaxation.x, lower, upper);
+        }
         if (!accepted && candidate_integral) {
             result.outcome = NodeOutcome::Fatal;
             result.fatal_status = MilpStatus::NUMERICAL_FAILURE;
@@ -1276,8 +1368,8 @@ NodeResult process_node(SharedSearchState& shared, WorkerContext& ctx, const Sha
     right->branch_distance = ceil_value - relaxation.x[jj];
 
     if (node_basis) {
-        ctx.pending_basis.emplace(left->order, node_basis);
-        ctx.pending_basis.emplace(right->order, node_basis);
+        left->parent_basis = node_basis;
+        right->parent_basis = node_basis;
     }
 
     result.outcome = NodeOutcome::Branched;
@@ -1297,6 +1389,32 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
     if (options.reliability_threshold == 0 &&
         options.branching_rule == MilpBranchingRule::RELIABILITY) {
         throw std::invalid_argument("MilpSolverOptions: reliability threshold must be positive");
+    }
+
+    // Exact enumeration path, when the caller opted in AND the model is
+    // exactly the structure ExactBinarySplit.hpp documents. A refusal here
+    // is ordinary: it just falls through to branch-and-bound below.
+    if (options.enable_exact_binary_split) {
+        const auto exact = try_exact_binary_split(problem, options.exact_binary_split_memory_bytes,
+                                                  options.exact_binary_split_threads);
+        if (exact.applicable && exact.solved) {
+            MilpSolution s;
+            s.status = MilpStatus::OPTIMAL;
+            s.has_incumbent = true;
+            s.x = exact.x;
+            s.objective_value = problem.maximize ? -exact.objective : exact.objective;
+            s.best_bound = s.objective_value;   // proven, so bound == value
+            s.relative_gap = 0.0;
+            s.lp_relaxations = 0;
+            s.nodes_processed = exact.subsets_examined;
+            s.incumbent_updates = 1;
+            return s;
+        }
+        if (exact.applicable && !exact.solved) {
+            MilpSolution s;
+            s.status = MilpStatus::INFEASIBLE;
+            return s;
+        }
     }
 
     MilpSolution solution;
@@ -1352,17 +1470,21 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
     }
     // Computed once and reused for every solve_lp() call this search makes
     // (node relaxations, diving, local improvement, strong-branching
-    // probes) -- see MilpSolverOptions::enable_integer_bound_rounding.
-    // Direct Simplex construction elsewhere in this file (the GMI cut path)
-    // bypasses solve_lp/presolve entirely already, so this mask has no
-    // effect there, by design.
-    if (options.enable_integer_bound_rounding) {
+    // probes) -- see MilpSolverOptions::enable_integer_bound_rounding and
+    // ::enable_gcd_tightening, which share this one mask (both need exactly
+    // "which columns are integer-restricted", so populating it twice under
+    // two different flags would be redundant, not safer). Direct Simplex
+    // construction elsewhere in this file (the GMI cut path) bypasses
+    // solve_lp/presolve entirely already, so this mask has no effect there,
+    // by design.
+    if (options.enable_integer_bound_rounding || options.enable_gcd_tightening) {
         relaxation_options.integer_columns.assign(static_cast<std::size_t>(problem.n_cols()), 0);
         for (std::int32_t j = 0; j < problem.n_cols(); ++j) {
             relaxation_options.integer_columns[static_cast<std::size_t>(j)] =
                 problem.variable_types[static_cast<std::size_t>(j)] != VariableType::CONTINUOUS ? 1 : 0;
         }
     }
+    relaxation_options.enable_gcd_tightening = options.enable_gcd_tightening;
 
     const std::uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
     const std::uint32_t n_workers =
@@ -1433,9 +1555,9 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
 
     if (continue_search) {
         if (n_workers <= 1) {
-            // Continue on THIS thread, reusing root_ctx so pseudocosts,
-            // pending_basis, and every counter accumulate exactly as the
-            // pre-parallel single-threaded code always did -- no
+            // Continue on THIS thread, reusing root_ctx so pseudocosts
+            // and every counter accumulate exactly as the pre-parallel
+            // single-threaded code always did -- no
             // std::thread is spawned at all, so parallel_worker_count's
             // default (1) costs nothing beyond the ConcurrentPriorityQueue's
             // own mutex, uncontended with a single caller. WorkerCoordinator
@@ -1468,8 +1590,8 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
             }
         } else {
             // Genuine multi-threaded phase: N fresh WorkerContexts (NOT
-            // continuing root_ctx's own pseudocost/pending_basis history --
-            // starting blank is a real, explicitly accepted difference
+            // continuing root_ctx's own pseudocost history -- starting
+            // blank is a real, explicitly accepted difference
             // from single-threaded search that affects tree shape/timing
             // only, never final-answer correctness; see
             // docs/architecture/MILP.md's parallel-B&B section).

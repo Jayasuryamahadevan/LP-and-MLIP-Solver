@@ -99,6 +99,20 @@ int main(int argc, char** argv) {
         argc > 10 ? (std::string(argv[10]) == "auto" ? 0u
                                                        : static_cast<std::uint32_t>(std::stoul(argv[10])))
                    : 1u;
+    // MilpSolverOptions::enable_gcd_tightening: off by default, matching
+    // that option's own default, so a plain invocation reproduces the
+    // existing baseline exactly.
+    const bool gcd_tightening = argc > 11 && std::string(argv[11]) == "on";
+    // MilpSolverOptions::max_live_warm_start_bases. argv[12]: a basis count,
+    // or 0 for unlimited (the pre-cap behaviour). Omitted leaves the option's
+    // own default in place.
+    const bool have_basis_cap = argc > 12;
+    const std::uint64_t basis_cap =
+        have_basis_cap ? static_cast<std::uint64_t>(std::stoull(argv[12])) : 0ull;
+
+    // MilpSolverOptions::enable_exact_binary_split. argv[13]: "on" enables
+    // the structurally-gated exact meet-in-the-middle path.
+    const bool exact_split = argc > 13 && std::string(argv[13]) == "on";
 
     std::cout << std::unitbuf;
 
@@ -125,6 +139,8 @@ int main(int argc, char** argv) {
               << " gmi_cuts=" << (gmi_cuts ? "on" : "off")
               << " integer_bound_rounding=" << (integer_bound_rounding ? "on" : "off")
               << " rens_heuristic=" << (rens_heuristic ? "on" : "off")
+              << " gcd_tightening=" << (gcd_tightening ? "on" : "off")
+              << " exact_split=" << (exact_split ? "on" : "off")
               << " parallel_workers=" << parallel_workers
               << " gpu_available=" << (process_start.gpu_available ? "yes" : "no") << '\n';
     std::cout << std::left << std::setw(18) << "instance" << std::right << std::setw(12)
@@ -158,6 +174,9 @@ int main(int argc, char** argv) {
             options.enable_root_gmi_cuts = gmi_cuts;
             options.enable_integer_bound_rounding = integer_bound_rounding;
             options.use_rens_heuristic = rens_heuristic;
+            options.enable_gcd_tightening = gcd_tightening;
+            if (have_basis_cap) options.max_live_warm_start_bases = basis_cap;
+            options.enable_exact_binary_split = exact_split;
             options.parallel_worker_count = parallel_workers;
             if (branching_rule == "most") {
                 options.branching_rule = sihps::MilpBranchingRule::MOST_FRACTIONAL;

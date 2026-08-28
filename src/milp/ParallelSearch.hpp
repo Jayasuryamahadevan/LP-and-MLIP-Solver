@@ -12,7 +12,6 @@
 #include <mutex>
 #include <optional>
 #include <queue>
-#include <unordered_map>
 #include <vector>
 
 namespace sihps {
@@ -199,16 +198,15 @@ struct WorkerContext {
     LpProblem workspace;
     std::vector<double> down_pseudocost, up_pseudocost;
     std::vector<std::uint32_t> down_observations, up_observations;
-    // Keyed by SearchNode::order (globally unique, assigned under the
-    // queue's own mutex when children are created -- see MilpSolver.cpp).
-    // A node is only ever popped by ONE worker, so only that worker ever
-    // needs its own parent's basis entry; a miss here (e.g. because a
-    // node's children got reassigned to a DIFFERENT worker than the one
-    // that created them, which the shared queue permits) is a pure
-    // warm-start-hit-rate degradation, never a correctness issue -- the
-    // existing single-threaded code already treats a pending_basis miss
-    // as "fall back to a cold solve," unchanged here.
-    std::unordered_map<std::uint64_t, std::shared_ptr<const Simplex::Basis>> pending_basis;
+    // The warm-start source basis for a node's relaxation travels on the
+    // SearchNode itself (SearchNode::parent_basis in MilpSolver.cpp), not
+    // in a per-worker side map: under the shared cross-worker queue, a
+    // node's children are very often popped by a DIFFERENT worker than the
+    // one that created them, which would leave most map entries inserted
+    // by the creating worker permanently unconsumed -- an unbounded leak,
+    // not merely a warm-start-hit-rate degradation (see SearchNode's own
+    // comment for the full account, including the measured 3.7GB->17GB
+    // blowup this caused before the fix).
 
     // Per-worker counters, summed into the real MilpSolution once every
     // worker has joined -- strictly better than a shared atomic per

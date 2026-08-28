@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <numeric>
 
 namespace sihps {
 namespace {
@@ -46,6 +48,20 @@ constexpr double kBoundRelax = 1e-9;
 
 // |u - l| below this treats a column as fixed.
 constexpr double kFixTol = 1e-11;
+
+// GCD row tightening (see Presolve.hpp's own comment on
+// `enable_gcd_tightening`) reads a row coefficient as "integer" only within
+// this relative tolerance -- tight enough that a coefficient carrying real
+// fractional structure (not floating-point noise around a whole number)
+// never gets misclassified, since misclassifying even one coefficient in a
+// row breaks this reduction's soundness argument entirely (Ax is a
+// multiple of gcd(a_j) only when EVERY term genuinely is).
+constexpr double kGcdCoeffIntTol = 1e-9;
+// Coefficients larger than this are declined rather than rounded to an
+// int64_t gcd input -- a defensive guard against overflow in the
+// std::llround conversion, not a scenario expected on any real model this
+// project has measured against.
+constexpr double kGcdMaxCoeffMagnitude = 1.0e15;
 
 // Doubleton substitution divides by the eliminated variable's own row
 // coefficient (both intercept and slope carry 1/a_e). A tiny a_e amplifies
@@ -104,7 +120,8 @@ struct Activity {
 
 PresolveResult presolve(const LpProblem& problem, int max_passes,
                          const std::vector<char>& integer_columns,
-                         bool enable_doubleton_substitution) {
+                         bool enable_doubleton_substitution,
+                         bool enable_gcd_tightening) {
     PresolveResult result;
     const std::int32_t m = problem.n_rows();
     const std::int32_t n = problem.n_cols();
@@ -470,6 +487,76 @@ PresolveResult presolve(const LpProblem& problem, int max_passes,
                 changed = true;
                 continue;
             }
+
+            // --- GCD-based row tightening (see Presolve.hpp's own comment
+            // on `enable_gcd_tightening`). Scoped to row_count >= 2: a
+            // row_count == 1 row is already handled exactly by the
+            // singleton-row block below (which divides by that single
+            // coefficient directly), so running this first would only
+            // duplicate that work.
+            if (enable_gcd_tightening && row_count[ii] >= 2) {
+                bool applicable = true;
+                std::int64_t g = 0;
+                for (std::int32_t k = A.row_ptr()[i]; k < A.row_ptr()[i + 1] && applicable; ++k) {
+                    const std::int32_t j = A.col_idx()[k];
+                    const double a = A.values()[k];
+                    if (a == 0.0) continue;
+                    if (!col_active[static_cast<std::size_t>(j)]) continue;
+                    if (!is_integer_column(static_cast<std::size_t>(j)) ||
+                        std::fabs(a) > kGcdMaxCoeffMagnitude) {
+                        applicable = false;
+                        break;
+                    }
+                    const double rounded = std::round(a);
+                    if (rounded == 0.0 ||
+                        std::fabs(a - rounded) > kGcdCoeffIntTol * std::max(1.0, std::fabs(a))) {
+                        applicable = false;
+                        break;
+                    }
+                    const std::int64_t ai = static_cast<std::int64_t>(rounded < 0 ? -rounded : rounded);
+                    g = (g == 0) ? ai : std::gcd(g, ai);
+                }
+
+                if (applicable && g > 1) {
+                    const double gd = static_cast<double>(g);
+                    // Tightened toward the row's own interior, then relaxed
+                    // outward by kBoundRelax exactly like tighten_upper/
+                    // tighten_lower above -- this value is exact arithmetic
+                    // given the preconditions just verified, but row_hi/
+                    // row_lo themselves may already carry floating-point
+                    // noise from an earlier pass's propagation, and the
+                    // outward pad is what this project's own policy
+                    // (kBoundRelax's doc comment) requires of every
+                    // reduction that tightens a bound.
+                    if (std::isfinite(row_hi[ii])) {
+                        const double tightened = gd * std::floor(row_hi[ii] / gd + kReductionTol);
+                        if (tightened < row_hi[ii] - kReductionTol * row_scale) {
+                            if (tightened < row_lo[ii] - kInfeasTol * row_scale) {
+                                fail("gcd tightening: no multiple of the row's coefficient "
+                                     "gcd lies within its bounds",
+                                     i, -1);
+                            } else {
+                                row_hi[ii] = tightened + kBoundRelax * (1.0 + std::fabs(tightened));
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (!infeasible && std::isfinite(row_lo[ii])) {
+                        const double tightened = gd * std::ceil(row_lo[ii] / gd - kReductionTol);
+                        if (tightened > row_lo[ii] + kReductionTol * row_scale) {
+                            if (tightened > row_hi[ii] + kInfeasTol * row_scale) {
+                                fail("gcd tightening: no multiple of the row's coefficient "
+                                     "gcd lies within its bounds",
+                                     i, -1);
+                            } else {
+                                row_lo[ii] = tightened - kBoundRelax * (1.0 + std::fabs(tightened));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (infeasible) break;
 
             // --- Singleton row: a single coefficient turns the row bounds
             // directly into bounds on that one variable.

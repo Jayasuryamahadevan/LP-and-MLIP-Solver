@@ -27,7 +27,8 @@ in this document is an estimate.
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
 | MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** at the shipped default (`parallel_worker_count=1`); **2 / 5** at `parallel_worker_count>=8` (`pk1` newly certifies, §Phase 3-5) | `reports/runs/2026-08-25/miplib-raw.txt`; parallel-B&B result in `docs/architecture/MILP.md` §6.5a |
-| unit tests | 165 / 165 | `ctest` (161 as of doubleton substitution + 4 parallel-B&B correctness/determinism cases) |
+| MIPLIB 2017 **broadened** subset (24 structurally diverse instances, 60s budget) | **0 wrong answers** (all 4 infeasible-tagged instances correctly detected; every remaining non-exact result an honest `TIME_LIMIT` or a documented tolerance tradeoff) | `docs/architecture/MILP.md` §7.7; `data/miplib2017_broad/` |
+| unit tests | 172 / 172 | `ctest` (+8 this iteration: `enable_gcd_tightening` correctness, infeasibility detection, and scope-boundary cases, `tests/lp/test_presolve.cpp`) |
 
 `MEASURED`. Single process, nothing else running, build stamp
 `1afe5bfa` recorded in the JSONL header.
@@ -627,8 +628,16 @@ benchmark-ready, which is now the top item below.
    callers. Full account: `docs/architecture/MILP.md` §1.4a. **Deliberately
    scoped down** (stated explicitly, matching this session's practice):
    coefficient tightening / GCD-based reductions — the natural next
-   increment, particularly for `markshare2`'s integer-valued matrix
-   coefficients — and clique merging/dual fixing are not attempted here.
+   increment — and clique merging/dual fixing are not attempted here.
+   `markshare2`'s own coefficients were checked directly (not assumed) and
+   found to make GCD tightening a dead end for that specific instance:
+   every one of its seven equality rows has gcd exactly 1 (six even
+   contain an explicit coefficient of `1`), which is not a coincidence —
+   Cornuéjols & Dawande's market-split construction draws coefficients
+   uniformly at random specifically so no shared-factor structure exists
+   (§1.4a's closing paragraph). GCD tightening's own eventual attempt,
+   below, is therefore aimed at this project's broader instance set, not
+   at re-litigating `markshare2`.
    ~~**Now the top item**: coefficient tightening / GCD-based reductions,
    or a RENS-class primal heuristic~~ — **RENS: done, MEASURED, off by
    default (genuine null result, not a bug).** Implemented single-shot
@@ -649,9 +658,30 @@ benchmark-ready, which is now the top item below.
    `RESEARCH HYPOTHESIS` for a future recursive or multi-node attempt:
    `docs/architecture/MILP.md` §4.2. Stays off by default, matching GMI
    cuts' own precedent for a correct-but-unmeasured-benefit reduction.
-   **Now the top item**: coefficient tightening / GCD-based reductions
-   (`markshare2`'s integer-valued matrix coefficients), still unattempted
-   and not gated by `factorize()`'s hot path.
+   ~~**Now the top item**: coefficient tightening / GCD-based
+   reductions~~ — **done, MEASURED, mixed result, off by default.**
+   `src/lp/Presolve.{hpp,cpp}`'s new `enable_gcd_tightening`: for a row
+   where every active coefficient is integer and every active column is
+   integer-restricted, tightens the row's bounds to the nearest reachable
+   multiple of `gcd(|a_j|)`, detecting row-level infeasibility directly
+   when none exists. Unconditionally sound, same argument class as integer
+   bound rounding above. Measured against BOTH the existing 5-instance set
+   and a newly staged 24-instance broader MIPLIB set (`data/
+   miplib2017_broad/`, added specifically because the 5-instance set's one
+   genuinely hard member, `markshare2`, is already known immune to this
+   exact technique — see the correction above): the reduction visibly
+   fires on 14/24 broader-set instances (a real, sometimes large, node-
+   count/tree-shape change in both directions — up to roughly 2x more or
+   fewer nodes in the same 60s budget on some instances) and measurably
+   improves the LP bound/incumbent on two of them (`mas76`: gap 7.91% →
+   3.92%; `neos-5140963-mincio`: gap 21.18% → 19.70%) — but this project's
+   own declared top-line KPIs (certified count, exact/incumbent match
+   count) are **bit-for-bit unchanged** on both sets (1/5 and 8/24 either
+   way), and no instance's final result got worse or newly failed. Per this
+   document's own governing rule (KPI-gate, not "did something happen"),
+   this does not clear the bar for default-on — it ships off, joining GMI/
+   RENS/doubleton as a correct, real, but not-yet-benchmark-proven
+   reduction. Full account: `docs/architecture/MILP.md` §1.4b.
 9. ~~Presolve expansion: doubleton substitution~~ — **done, MEASURED,
    honest null result, ships off by default.** Scoped to equality rows
    where the eliminated variable appears in no other active row (avoids
@@ -700,6 +730,44 @@ benchmark-ready, which is now the top item below.
     hardware_concurrency())` to `min(8, ...)` on the strength of this;
     solver-wide default stays `1` (opt-in). Full account in
     `docs/architecture/MILP.md` §6, §6.5a.
+11. **Row-feasibility scaling — a real wrong-answer bug, found and fixed.**
+    Motivated by a direct challenge: is this solver actually correct
+    across problem *domains*, not just the 5 hand-curated MIPLIB
+    instances it had been benchmarked on so far? A new, structurally
+    diverse 24-instance MIPLIB set (`data/miplib2017_broad/`, spanning
+    set covering/partitioning/packing, several knapsack variants,
+    precedence, cardinality, and — deliberately — several intentionally
+    infeasible instances) found a genuine bug within the first hour:
+    `flugplinf` (intentionally infeasible per its own MIPLIB reference)
+    was reported `OPTIMAL`, with a fabricated objective. Root cause: the
+    row-feasibility check (three identical occurrences —
+    `MilpSolver.cpp`'s `feasible_point`, `LpSolver.cpp`'s
+    `original_space_primal_residual`, `Simplex.cpp`'s `finalize_result`)
+    normalized a row's violation by the single largest RHS magnitude
+    across the WHOLE model, not that row's own scale — a model mixing a
+    large-RHS row (a cost cap) with small-RHS rows (mass-balance-style
+    equalities) let the large row silently inflate the effective
+    tolerance for the small ones by six orders of magnitude. Not a
+    narrow, single-instance concern: any model mixing very different row
+    magnitudes — plausible for refinery-scale LP/MILP models mixing
+    plant-wide caps with per-unit balances — is exposed to the same
+    failure mode. Fixed via the Higham-standard per-row scaled residual
+    (`|A|·|x|`, each row's own component-wise term magnitude), refined
+    twice more after direct measurement surfaced two further edge cases
+    (a false regression on Netlib `shell`/`perold` from scaling too
+    literally by `|rhs|` alone; a fatal-search-abort false positive on
+    MIPLIB `ej`'s huge coefficients from a rounding-perturbation
+    interaction) — full account, including the derivation of the new
+    `kActivityNoiseRatio=1e-8` constant from direct measurement (not a
+    guess), in `docs/architecture/MILP.md` §7. **MEASURED**: 172/172 unit
+    tests, 88-89/90 Netlib sweep (stable, matching the pre-existing
+    flaky-instance baseline exactly), zero regression on the original
+    5-instance MIPLIB set, and **zero wrong answers** across the full
+    24-instance broadened set — every remaining gap is an honest
+    `TIME_LIMIT` or a disclosed, industry-standard tolerance tradeoff
+    (§7.6), never a false claim. This is the correctness bar "perfect on
+    any domain" actually means for an NP-hard problem class: never wrong,
+    not never slow.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

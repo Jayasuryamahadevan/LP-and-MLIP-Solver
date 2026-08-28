@@ -127,6 +127,12 @@ struct LpSolverOptions {
     // by default pending a KPI-gate benchmark, matching this project's own
     // standing rule for every optimization shipped this session.
     bool enable_doubleton_substitution = false;
+
+    // Threaded straight through to presolve()'s own `enable_gcd_tightening`
+    // parameter (see Presolve.hpp). False by default pending a KPI-gate
+    // benchmark, same rule as `enable_doubleton_substitution` above. Has no
+    // effect unless `integer_columns` is also populated.
+    bool enable_gcd_tightening = false;
 };
 
 struct LpSolution {

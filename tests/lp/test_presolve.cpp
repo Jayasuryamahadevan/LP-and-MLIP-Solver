@@ -616,3 +616,230 @@ SIHPS_TEST(presolve_doubleton_redistributes_the_eliminated_variables_objective_c
     SIHPS_ASSERT_NEAR(reduced.x[0], 0.0, 1e-6);
     SIHPS_ASSERT_NEAR(reduced.x[1], 5.0, 1e-6);
 }
+
+// --- GCD-based row tightening (opt-in via `enable_gcd_tightening`; see
+// Presolve.hpp's own comment) -------------------------------------------
+
+// 2x + 4y <= 7, x,y integer in [0,10]. gcd(2,4) = 2, and Ax is therefore
+// always even -- the true reachable bound is <= 6, not <= 7. The row is not
+// dropped (activity range [0,60] does not imply it), so the tightened
+// bound must be directly observable in the reduced row's own rhs.
+SIHPS_TEST(presolve_gcd_tightens_an_inequality_row_to_a_reachable_multiple) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 2.0}, {0, 1, 4.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {7.0};
+    p.row_types = {'L'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 1};
+    auto r = presolve(p, 20, integer_columns, /*enable_doubleton_substitution=*/false,
+                       /*enable_gcd_tightening=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    bool found = false;
+    for (std::size_t k = 0; k < r.kept_rows.size(); ++k) {
+        if (r.kept_rows[k] == 0) {
+            // Allow presolve's own outward safety margin (kBoundRelax),
+            // same convention as every other bound-tightening test in this
+            // file: required to be a RELAXATION of the true tightened
+            // value, never an over-tightening, and definitively below the
+            // original, un-tightened 7.0.
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] <= 6.0 + 1e-6);
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] >= 6.0 - 1e-6);
+            found = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found);
+}
+
+// The lower-bound analogue via a 'G' row: 6x + 9y >= 10, x,y integer,
+// gcd(6,9) = 3. The smallest reachable multiple of 3 that is >= 10 is 12.
+SIHPS_TEST(presolve_gcd_tightens_a_ge_row_to_a_reachable_multiple) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 6.0}, {0, 1, 9.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {10.0};
+    p.row_types = {'G'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 1};
+    auto r = presolve(p, 20, integer_columns, /*enable_doubleton_substitution=*/false,
+                       /*enable_gcd_tightening=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    bool found = false;
+    for (std::size_t k = 0; k < r.kept_rows.size(); ++k) {
+        if (r.kept_rows[k] == 0) {
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] >= 12.0 - 1e-6);
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] <= 12.0 + 1e-6);
+            found = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found);
+}
+
+// 4x + 6y == 7, x,y integer: Ax is always even, and 7 is odd, so no
+// integer-feasible point can ever satisfy this row regardless of x/y's
+// bounds -- a genuine, hand-verifiable infeasibility that GCD tightening
+// must detect directly (not merely fail to tighten).
+SIHPS_TEST(presolve_gcd_tightening_detects_an_unreachable_equality) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 4.0}, {0, 1, 6.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {7.0};
+    p.row_types = {'E'};
+    p.lower = {0.0, 0.0};
+    p.upper = {5.0, 5.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 1};
+    auto r = presolve(p, 20, integer_columns, /*enable_doubleton_substitution=*/false,
+                       /*enable_gcd_tightening=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::INFEASIBLE);
+}
+
+// Backward compatibility / opt-in check: the same 2x + 4y <= 7 fixture as
+// the first test above, but with `enable_gcd_tightening` left at its
+// default (false) -- the row must survive UNTIGHTENED, proving the
+// reduction is genuinely opt-in rather than firing whenever
+// `integer_columns` happens to be populated (which also drives the
+// unrelated, always-on integer bound-rounding reduction).
+SIHPS_TEST(presolve_gcd_tightening_is_off_by_default) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 2.0}, {0, 1, 4.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {7.0};
+    p.row_types = {'L'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 1};
+    auto r = presolve(p, 20, integer_columns); // enable_gcd_tightening defaults false
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    bool found = false;
+    for (std::size_t k = 0; k < r.kept_rows.size(); ++k) {
+        if (r.kept_rows[k] == 0) {
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] >= 6.5); // nowhere near the tightened 6.0
+            found = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found);
+}
+
+// Scope boundary: a row with even ONE continuous (non-integer-restricted)
+// column must be left entirely untouched, since Ax is then no longer
+// guaranteed to be an integer multiple of anything -- the reduction's own
+// soundness argument does not hold. Same 2x + 4y <= 7 shape, y now
+// continuous.
+SIHPS_TEST(presolve_gcd_tightening_declines_a_row_with_a_continuous_column) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 2.0}, {0, 1, 4.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {7.0};
+    p.row_types = {'L'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 0}; // x integer, y continuous
+    auto r = presolve(p, 20, integer_columns, /*enable_doubleton_substitution=*/false,
+                       /*enable_gcd_tightening=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    bool found = false;
+    for (std::size_t k = 0; k < r.kept_rows.size(); ++k) {
+        if (r.kept_rows[k] == 0) {
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] >= 6.5);
+            found = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found);
+}
+
+// Scope boundary: a row with a genuinely non-integer coefficient must also
+// be left untouched, even with every column integer-restricted.
+SIHPS_TEST(presolve_gcd_tightening_declines_a_row_with_a_fractional_coefficient) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 2.0}, {0, 1, 4.5}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {0.0, 0.0};
+    p.rhs = {7.0};
+    p.row_types = {'L'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    std::vector<char> integer_columns = {1, 1};
+    auto r = presolve(p, 20, integer_columns, /*enable_doubleton_substitution=*/false,
+                       /*enable_gcd_tightening=*/true);
+    SIHPS_ASSERT_TRUE(r.status == PresolveStatus::OK);
+
+    bool found = false;
+    for (std::size_t k = 0; k < r.kept_rows.size(); ++k) {
+        if (r.kept_rows[k] == 0) {
+            SIHPS_ASSERT_TRUE(r.reduced.rhs[k] >= 6.5);
+            found = true;
+        }
+    }
+    SIHPS_ASSERT_TRUE(found);
+}
+
+// End-to-end: the tightened row bound must actually move solve_lp's
+// reported LP-relaxation OPTIMUM, not merely presolve's internal state --
+// this is the property that matters for a B&B caller, which prunes on
+// exactly this bound. `integer_columns` is populated IDENTICALLY in both
+// solves below (so the ordinary, always-on integer bound-ROUNDING effect
+// that `integer_columns` alone already triggers -- see
+// `presolve_integer_rounding_...` tests above -- is held constant); only
+// `enable_gcd_tightening` differs, isolating this reduction's own marginal
+// contribution.
+//
+// maximize 3x + 2y s.t. 4x + 6y <= 11, x,y in [0,10], both integer-
+// restricted. Per-variable propagation alone (active either way, since it
+// does not depend on `enable_gcd_tightening`) already rounds x's derived
+// bound 11/4=2.75 down to 2 and y's 11/6=1.833 down to 1 -- but the ROW's
+// own rhs stays 11 unless GCD tightening runs. Hand-derived continuous
+// optimum against x<=2, y<=1, row<=11 (x is filled to its bound first: its
+// row-coefficient-normalized objective ratio 3/4=0.75 exceeds y's
+// 2/6=0.333): x=2, y=(11-8)/6=0.5, objective 3*2+2*0.5=7.0. GCD tightening
+// additionally reduces the row itself: gcd(4,6)=2, floor(11/2)*2=10, so
+// with the SAME x<=2/y<=1 column bounds the optimum becomes x=2,
+// y=(10-8)/6=1/3, objective 3*2+2/3=20/3 -- strictly tighter, and not
+// reachable by column-bound rounding alone.
+SIHPS_TEST(presolve_gcd_tightening_moves_the_lp_relaxation_optimum) {
+    LpProblem p;
+    std::vector<Triplet> t = {{0, 0, 4.0}, {0, 1, 6.0}};
+    p.A = CSRMatrix::from_triplets(1, 2, t);
+    p.obj = {-3.0, -2.0}; // maximize 3x + 2y == minimize -3x - 2y
+    p.rhs = {11.0};
+    p.row_types = {'L'};
+    p.lower = {0.0, 0.0};
+    p.upper = {10.0, 10.0};
+    sihps::apply_default_row_bounds(p);
+
+    LpSolverOptions without;
+    without.integer_columns = {1, 1};
+    without.enable_gcd_tightening = false;
+    const auto baseline = solve_lp(p, without);
+    SIHPS_ASSERT_TRUE(baseline.status == LpStatus::OPTIMAL);
+    SIHPS_ASSERT_NEAR(baseline.objective_value, -7.0, 1e-4);
+
+    LpSolverOptions with;
+    with.integer_columns = {1, 1};
+    with.enable_gcd_tightening = true;
+    const auto tightened = solve_lp(p, with);
+    SIHPS_ASSERT_TRUE(tightened.status == LpStatus::OPTIMAL);
+    SIHPS_ASSERT_NEAR(tightened.objective_value, -20.0 / 3.0, 1e-4);
+}

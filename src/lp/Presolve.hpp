@@ -121,6 +121,7 @@ struct PresolveResult {
 //   - integer bound rounding (see `integer_columns` below)
 //   - doubleton-equation substitution, SCOPED (see `enable_doubleton_
 //     substitution` below) -- NOT the general case
+//   - GCD-based row tightening (see `enable_gcd_tightening` below)
 //
 // Reduction deliberately NOT applied in its general form, and why: a
 // doubleton row's eliminated variable, in general, can appear in OTHER
@@ -175,9 +176,33 @@ struct PresolveResult {
 // the two variables appears in NO other active row, eliminates that
 // variable by substitution -- see `PresolveResult::doubleton_eliminations`
 // above for the exact contract and soundness argument.
+//
+// `enable_gcd_tightening`, false by default (same standing rule as
+// `enable_doubleton_substitution`). ESTABLISHED METHOD (Achterberg, Bixby,
+// Gu, Rothberg & Weninger 2020, \S3.4 "gcd" reduction). Requires
+// `integer_columns` to be populated -- with no integer columns flagged, this
+// reduction can never find a row where EVERY active variable qualifies, so
+// it is a silent no-op for an ordinary LP caller, exactly like integer
+// bound rounding above.
+//
+// For a row where every active coefficient is (numerically) integer AND
+// every active column is integer-restricted, the row's activity `Ax` can
+// only ever take a value that is a multiple of g = gcd(|a_j|). When g > 1,
+// the row's finite bounds are tightened to the nearest reachable multiple
+// of g (floor for the upper bound, ceil for the lower bound); if this
+// pushes the tightened lower bound above the tightened upper bound, no
+// multiple of g exists inside the original bounds and the row -- hence the
+// whole model -- is INFEASIBLE, detected directly rather than left for the
+// simplex to discover indirectly. UNCONDITIONALLY SOUND: no integer-
+// feasible point is ever excluded, since every such point's activity was
+// already a multiple of g before this reduction ran. A row mixing even one
+// continuous column, or one non-integer coefficient, is left untouched in
+// its entirety -- this is a scope boundary (the reduction's own soundness
+// argument does not hold otherwise), not a missed case.
 PresolveResult presolve(const LpProblem& problem, int max_passes = 20,
                          const std::vector<char>& integer_columns = {},
-                         bool enable_doubleton_substitution = false);
+                         bool enable_doubleton_substitution = false,
+                         bool enable_gcd_tightening = false);
 
 // Expands a solution of the reduced problem back into ORIGINAL column
 // space: kept columns take their solved value, removed columns take the

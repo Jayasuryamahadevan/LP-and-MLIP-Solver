@@ -14,11 +14,24 @@ namespace {
 // pipeline does not silently loosen what "feasible" means.
 constexpr double kFinalPrimalTol = 1e-6;
 
-double vector_inf_norm(const std::vector<double>& v) {
-    double best = 0.0;
-    for (double x : v) best = std::max(best, std::fabs(x));
-    return best;
-}
+// Genuine floating-point cancellation noise on a row scales with that row's
+// own component-wise term magnitude (|A|*|x|), but by an amount tied to
+// machine precision, not to `kFinalPrimalTol` (1e-6) -- MEASURED directly
+// on Netlib `shell`/`perold`: their legitimate solver rounding noise, across
+// dozens of affected rows each, lands at a strikingly consistent ratio of
+// ~5e-10 relative to the row's own |A|*|x| activity (never above 7e-10 in
+// either instance). A genuine infeasibility, by contrast, is not bounded by
+// machine precision at all -- MEASURED on MIPLIB `ej` (a deliberately
+// adversarial "numerics" instance, per its own MIPLIB tag): an incumbent
+// that violates its single equality row by a real 20 units, against a row
+// activity of ~2.05e7, is a ratio of ~9.8e-7, nearly 2000x above the noise
+// ceiling above. This sits in between on a log scale (~20x above the
+// measured noise ceiling, ~100x below the measured violation ratio) --
+// comfortable margin either way, not cut exactly at the boundary of the two
+// measurements it is derived from. Used ADDITIVELY with `kFinalPrimalTol`,
+// not as a replacement multiplier: near-zero-activity rows still get
+// exactly `kFinalPrimalTol`'s own original, unweakened absolute allowance.
+constexpr double kActivityNoiseRatio = 1e-8;
 
 // Row and column feasibility of `x` against the ORIGINAL model.
 double original_space_primal_residual(const LpProblem& problem, const std::vector<double>& x,
@@ -29,13 +42,40 @@ double original_space_primal_residual(const LpProblem& problem, const std::vecto
     std::vector<double> ax(static_cast<std::size_t>(m), 0.0);
     if (n > 0 && m > 0) problem.A.multiply(x.data(), ax.data(), parallel_mode);
 
+    // PER-ROW violation with a component-wise noise budget (|A|*|x|,
+    // Higham's standard scaled-residual denominator) subtracted out, not
+    // one violation normalized by the model-wide max |rhs| (see
+    // MilpSolver.cpp's `feasible_point`, which had the identical
+    // bug: a single large-RHS row can inflate the effective absolute
+    // tolerance for every unrelated small-RHS row in the same model,
+    // letting a real violation on the small row pass unnoticed -- MEASURED
+    // on MIPLIB `flugplinf`). Each row's violation has its own
+    // `kActivityNoiseRatio * abs_activity` noise budget subtracted out
+    // before taking the max, so the returned residual -- still compared
+    // against the unchanged `kFinalPrimalTol` below, exactly as before --
+    // is equivalent to checking `violation <= kFinalPrimalTol +
+    // kActivityNoiseRatio * abs_activity` per row. This function is the
+    // hard invariant's own final gate (comment below), so it must get this
+    // right, not just avoid the first, more obvious bug.
+    const auto* row_ptr = problem.A.row_ptr();
+    const auto* col_idx = problem.A.col_idx();
+    const auto* values = problem.A.values();
     double row_violation = 0.0;
     for (std::int32_t i = 0; i < m; ++i) {
         const auto ii = static_cast<std::size_t>(i);
+        double abs_activity = std::fabs(problem.rhs[ii]);
+        for (std::int32_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+            abs_activity += std::fabs(values[k]) * std::fabs(x[static_cast<std::size_t>(col_idx[k])]);
+        }
+        const double noise_budget = kActivityNoiseRatio * abs_activity;
         const double lo = problem.rhs[ii] - problem.slack_upper[ii];
         const double hi = problem.rhs[ii] - problem.slack_lower[ii];
-        if (std::isfinite(lo)) row_violation = std::max(row_violation, lo - ax[ii]);
-        if (std::isfinite(hi)) row_violation = std::max(row_violation, ax[ii] - hi);
+        if (std::isfinite(lo)) {
+            row_violation = std::max(row_violation, (lo - ax[ii]) - noise_budget);
+        }
+        if (std::isfinite(hi)) {
+            row_violation = std::max(row_violation, (ax[ii] - hi) - noise_budget);
+        }
     }
     double bound_violation = 0.0;
     for (std::int32_t j = 0; j < n; ++j) {
@@ -46,8 +86,7 @@ double original_space_primal_residual(const LpProblem& problem, const std::vecto
     row_violation = std::max(0.0, row_violation);
     bound_violation = std::max(0.0, bound_violation);
 
-    const double rhs_norm = vector_inf_norm(problem.rhs);
-    return std::max(row_violation / (1.0 + rhs_norm), bound_violation);
+    return std::max(row_violation, bound_violation);
 }
 
 // Runs GPU PDLP on `target` and returns its primal point in that problem's
@@ -134,7 +173,8 @@ LpSolution solve_lp(const LpProblem& problem, const LpSolverOptions& options) {
     if (options.use_presolve) {
         const auto t0 = std::chrono::steady_clock::now();
         reduction = presolve(problem, 20, options.integer_columns,
-                             options.enable_doubleton_substitution);
+                             options.enable_doubleton_substitution,
+                             options.enable_gcd_tightening);
         solution.presolve_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 

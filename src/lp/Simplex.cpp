@@ -43,6 +43,24 @@ constexpr double kOptTol = 1e-7;
 constexpr double kPivotTol = 1e-9;
 constexpr double kFinalTol = 1e-6;
 
+// Genuine floating-point cancellation noise on a row scales with that row's
+// own component-wise term magnitude (|A|*|x|), but by an amount tied to
+// machine precision, not to `kFinalTol` (1e-6) -- MEASURED directly on
+// Netlib `shell`/`perold`: their legitimate solver rounding noise, across
+// dozens of affected rows each, lands at a strikingly consistent ratio of
+// ~5e-10 relative to the row's own |A|*|x| activity (never above 7e-10 in
+// either instance). A genuine infeasibility, by contrast, is not bounded by
+// machine precision at all -- MEASURED on MIPLIB `ej` (a deliberately
+// adversarial "numerics" instance, per its own MIPLIB tag): an incumbent
+// that violates its single equality row by a real 20 units, against a row
+// activity of ~2.05e7, is a ratio of ~9.8e-7, nearly 2000x above the noise
+// ceiling above. This sits in between on a log scale (~20x above the
+// measured noise ceiling, ~100x below the measured violation ratio) --
+// comfortable margin either way. Used ADDITIVELY with `kFinalTol`, not as a
+// replacement multiplier: near-zero-activity rows still get exactly
+// `kFinalTol`'s own original, unweakened absolute allowance.
+constexpr double kActivityNoiseRatio = 1e-8;
+
 // Harris ratio-test bound expansion (docs/research/SOTA.md \S1.4.2). Pass 1
 // relaxes every basic variable's bound by this much so pass 2 has a set of
 // near-tied rows to choose the largest pivot from.
@@ -1356,13 +1374,33 @@ void Simplex::finalize_result(LpStatus status, LpResult& result) {
     if (n_struct_ > 0) {
         problem_.A.multiply(result.x.data(), ax.data());
     }
+    // PER-ROW violation with a component-wise noise budget (|A|*|x|,
+    // Higham's standard scaled-residual denominator) subtracted out, not
+    // one violation normalized by the model-wide max |rhs|
+    // (LpSolver.cpp's `original_space_primal_residual` and
+    // MilpSolver.cpp's `feasible_point` had the identical bug: a single
+    // large-RHS row can inflate the effective absolute tolerance for every
+    // unrelated small-RHS row in the same model -- MEASURED on MIPLIB
+    // `flugplinf`). See `kActivityNoiseRatio`'s own comment above for why
+    // the noise budget is additive and tied to machine-precision-scale
+    // noise, not to `kFinalTol` itself (MEASURED on Netlib `shell`/
+    // `perold` and MIPLIB `ej`).
+    const auto* row_ptr = problem_.A.row_ptr();
+    const auto* col_idx = problem_.A.col_idx();
+    const auto* values = problem_.A.values();
     double row_violation = 0.0;
     for (std::int32_t i = 0; i < n_rows_; ++i) {
         const auto ii = static_cast<std::size_t>(i);
+        double abs_activity = std::fabs(problem_.rhs[ii]);
+        for (std::int32_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+            abs_activity +=
+                std::fabs(values[k]) * std::fabs(result.x[static_cast<std::size_t>(col_idx[k])]);
+        }
+        const double noise_budget = kActivityNoiseRatio * abs_activity;
         const double lo = problem_.rhs[ii] - problem_.slack_upper[ii];
         const double hi = problem_.rhs[ii] - problem_.slack_lower[ii];
-        row_violation = std::max(row_violation, std::max(0.0, lo - ax[ii]));
-        row_violation = std::max(row_violation, std::max(0.0, ax[ii] - hi));
+        row_violation = std::max(row_violation, std::max(0.0, (lo - ax[ii]) - noise_budget));
+        row_violation = std::max(row_violation, std::max(0.0, (ax[ii] - hi) - noise_budget));
     }
     double bound_violation = 0.0;
     for (std::int32_t j = 0; j < n_struct_; ++j) {
@@ -1372,8 +1410,7 @@ void Simplex::finalize_result(LpStatus status, LpResult& result) {
         bound_violation =
             std::max(bound_violation, std::max(0.0, result.x[jj] - problem_.upper[jj]));
     }
-    const double rhs_norm = vector_inf_norm(problem_.rhs);
-    result.primal_residual = std::max(row_violation / (1.0 + rhs_norm), bound_violation);
+    result.primal_residual = std::max(row_violation, bound_violation);
 
     // Dual residual, in ORIGINAL units: rc_orig_j = rc'_j / C_j for
     // structural columns, rc_orig_i = R_i * rc'_i for slack columns

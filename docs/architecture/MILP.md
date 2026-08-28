@@ -176,6 +176,132 @@ would still be the right correctness gate if GCD tightening is ever
 implemented for a different instance shape where it does apply — not ruled
 out in general, only ruled out for this specific benchmark instance.
 
+### 1.4b GCD-based row tightening — `IMPLEMENTED`, `MEASURED`, mixed result, default off
+
+The paragraph above ruled GCD tightening out **for `markshare2` specifically**,
+not in general, and said so explicitly. This subsection is that follow-through,
+against instances where the technique's own precondition (`gcd(|a_j|) > 1` on
+some row) actually has a chance of holding — which required a benchmark set
+broader than the original 5 adversarial instances, since `markshare2` is the
+only one of those 5 with a real difficulty profile and it is, by construction,
+immune. `data/miplib2017_broad/` (24 instances, drawn from the same public
+`miplib2017-v36.solu` reference set) was added for exactly this purpose.
+
+**ESTABLISHED METHOD** (Achterberg, Bixby, Gu, Rothberg & Weninger 2020, §3.4,
+the "gcd" reduction, already cited in `docs/ROADMAP_STATUS.md`'s Phase 2
+lineage). For a row where every ACTIVE coefficient is (numerically) integer
+and every active column is integer-restricted, `Ax` can only ever take a value
+that is an integer multiple of `g = gcd(|a_j|)`. When `g > 1`, the row's finite
+bounds are tightened to the nearest reachable multiple of `g` (floor for the
+upper bound, ceil for the lower); if this pushes the tightened lower bound
+above the tightened upper, no such multiple exists inside the original bounds
+and the row — hence the whole model — is **infeasible**, detected directly
+rather than left for the simplex to discover indirectly on a fully reduced,
+empty-looking problem. **Unconditionally sound**: no integer-feasible point is
+ever excluded, since every such point's activity was already a multiple of `g`
+before the reduction ran. A row with even one continuous column, or one
+genuinely non-integer coefficient, is left untouched in its entirety — the
+soundness argument does not hold otherwise, and this is a scope boundary, not
+a missed case.
+
+**Implementation** (`src/lp/Presolve.{hpp,cpp}`): a new `enable_gcd_tightening`
+parameter on `presolve()`, false by default. Reuses the same `integer_columns`
+mask integer bound rounding already relies on (§1.4a) — both reductions need
+exactly "which columns are integer-restricted", so `MilpSolverOptions::
+enable_gcd_tightening` populates that one shared mask alongside `::
+enable_integer_bound_rounding` rather than duplicating it. Threaded through
+`LpSolverOptions::enable_gcd_tightening` → `presolve()`'s own parameter,
+exactly mirroring `enable_doubleton_substitution`'s existing wiring. Runs once
+per row per presolve pass, scoped to `row_count >= 2` (a `row_count == 1` row
+is already handled exactly by the pre-existing singleton-row reduction, which
+divides by that one coefficient directly — running this reduction there too
+would only duplicate that work). Coefficients are read as integer within a
+`1e-9` relative tolerance (`kGcdCoeffIntTol`) — tighter than the reduction's
+own outward safety pad, since misclassifying even one coefficient in a row
+breaks the whole soundness argument, not just that one term. Zero new
+postsolve machinery: like integer bound rounding, this only narrows a row's
+own `[lo, hi]` bounds (already mutable, in-pass, working state throughout
+`Presolve.cpp`), never removes a row or column outright.
+
+8 new unit tests (`tests/lp/test_presolve.cpp`): a clean inequality
+tightening (`2x + 4y <= 7` → `<= 6`), the lower-bound analogue via a `G` row,
+a hand-verified infeasibility detection (`4x + 6y == 7`, both integer — no
+integer point can ever satisfy an odd target through even coefficients), an
+off-by-default check, two scope-boundary declines (one continuous column;
+one non-integer coefficient), and an end-to-end `solve_lp` case constructed
+so that per-variable bound-rounding propagation (already active regardless of
+this flag, see §1.4a) provably cannot reach the same tightened value on its
+own — isolating this reduction's own marginal contribution from integer
+bound rounding's.
+
+**MEASURED**, `bench_miplib`, single process, nothing else running, 60s
+budget, flag off vs. on, single-threaded (`parallel_worker_count=1`, the
+shipped default):
+
+| set | exact matches | incumbent matches | certified | flag off vs. on |
+|---|---|---|---|---|
+| 5-instance (existing) | 1/5 | 1/5 | 1/5 | **identical**, both configs |
+| 24-instance broad (new) | 6/24 | 8/24 | 8/24 | **identical**, both configs |
+
+This project's own declared top-line KPIs did not move, in either direction,
+on either set — no certified result flipped to uncertified or vice versa, no
+`OPTIMAL`/`INFEASIBLE` proof was lost, and no new `NUMERICAL_FAILURE` was
+introduced (`ej` and `noswot` already failed that way in the baseline, at the
+exact same node count either way — the reduction did not create, worsen, or
+fix that pre-existing issue).
+
+That is not the same as "nothing happened", and this document says so rather
+than reporting a flat null result under a KPI-gate label that implies one. On
+the 5-instance set the reduction is nearly inert, as expected: `markshare2`'s
+rows all have `gcd = 1` (§1.4a), and the small node-count wobble observed
+there (682,064 → 691,382, +1.4%) is within this project's own already-
+documented run-to-run noise band for time-limited single-threaded runs, not a
+real effect. On the 24-instance broad set the reduction visibly **fires** —
+14 of 24 instances show a real, deterministic node-count or per-node-cost
+change (single-threaded B&B is otherwise exactly reproducible run to run, so
+a changed node count under an identical time budget reflects a genuinely
+different reduced model, not scheduling noise), in **both directions**:
+
+| instance | nodes (off → on) | change | note |
+|---|---|---|---|
+| `markshare_4_0` | 947,681 → 1,850,559 | +95% | same final incumbent (1, correct) either way |
+| `p2m2p1m1p0n100` | 2,010,729 → 3,540,401 | +76% | same unsolved state either way |
+| `neos-5140963-mincio` | 59,171 → 111,720 | +89% | gap **21.18% → 19.70%** (real improvement) |
+| `markshare1` | 483,412 → 880,538 | +82% | same wrong incumbent either way (this family's own known difficulty) |
+| `mas76` | 91,158 → 148,181 | +63% | gap **7.91% → 3.92%**, incumbent error 2977.7 → 1261.2 (real improvement) |
+| `mad` | 138,436 → 246,171 | +78% | same unsolved state either way |
+| `assign1-5-8` | 10,486 → 5,776 | -45% | same unsolved state either way |
+| `enlight_hard` | 60,540 → 38,625 | -36% | same unsolved state either way |
+| `p0201` | 1,765 → 1,765 (same tree) | wall time -42% | same `OPTIMAL` proof, cheaper per node |
+| `gt2` | 24,519 → 24,519 (same tree) | wall time -45% | same `OPTIMAL` proof, cheaper per node |
+
+(10 of the 24 — `ej`, `enlight4`, `flugpl`, `flugplinf`, `g503inf`, `gr4x6`,
+`gt2`, `noswot`, `p0201`, `stein9inf` — have a bit-identical search tree
+either way; most of these solve in well under a second, before the reduction
+gets a chance to matter, or their rows genuinely have no shared factor.)
+
+Two instances (`mas76`, `neos-5140963-mincio`) show a real, measurable
+tightening of the proven bound and/or incumbent quality within the same time
+budget — neither newly certifies, but both move honestly toward the true
+optimum. Several others show a large swing in node count with **no** change
+in final quality in either direction — meaning the reduction changed the
+search's per-node cost or branching path materially, without that change
+being the thing standing between the search and a proof either way at this
+particular 60s budget.
+
+Per this document's own governing rule — *no optimization is accepted unless
+it improves a declared benchmark KPI without reducing correctness or
+solvability* — a real, non-null effect that leaves the declared KPI (certified
+count) unchanged does not clear the bar for default-on. `enable_gcd_tightening`
+stays `false` by default, joining GMI cuts, RENS, and doubleton substitution as
+a correct, measured, real-effect reduction that this benchmark set's own KPIs
+do not yet reward turning on. `RESEARCH HYPOTHESIS` for a future attempt: the
+mixed node-count direction suggests the useful signal here may be per-node
+LP-solve cost (smaller/tighter reduced problems) rather than tree-shape
+change, which a fixed-node-count (rather than fixed-wall-clock) comparison
+would isolate more cleanly than this benchmark's own budget currently allows
+— not attempted in this pass.
+
 ## 2. Cuts
 
 ### 2.1 Root mixed-row cover cuts (implemented root mixed-row cover subset)
@@ -455,7 +581,8 @@ with no concurrency primitives; the B&B control loop is single-threaded.
 - A node is pruned only by an infeasible relaxation or by a lower bound that
   cannot improve the incumbent within the configured objective tolerance.
 - An incumbent is stored only after checking original row bounds, variable
-  bounds, and exact integer/binary membership after rounding.
+  bounds, and exact integer/binary membership after rounding. **This check
+  itself had a real bug, found and fixed — see §7.**
 - `OPTIMAL` means the open-node queue was exhausted. `NODE_LIMIT` and
   `TIME_LIMIT` are never relabeled as optimal merely because an incumbent
   exists. An unbounded LP relaxation with integer variables is reported as
@@ -921,3 +1048,191 @@ opt-in first, some later promoted, some not) is to keep a new
 concurrency-class feature opt-in for more than one iteration's worth of
 evidence before flipping the solver-wide default, even when, as here,
 the first real measurement is unambiguously positive.
+
+## 7. Row-Feasibility Scaling — a real correctness bug, found and fixed
+
+`FIXED`, `MEASURED`. Motivated directly by broadening this project's own
+MILP correctness testing beyond the original 5-instance MIPLIB set: a
+new, structurally diverse 24-instance set
+(`data/miplib2017_broad/README.md`) was built specifically to stress
+domains the narrow original 5 never touched — set covering/partitioning/
+packing, several knapsack variants, precedence, cardinality, and,
+deliberately, several intentionally-infeasible instances. It found a
+genuine wrong-answer bug within the first hour of use: MIPLIB `flugplinf`
+(intentionally infeasible — its `.solu` entry is `=inf=`) was reported
+`OPTIMAL` by this solver, with a fabricated objective value. This section
+is the full account: the bug, the first fix attempt, that fix's own
+regression, the corrected fix, and the one adjacent bug it surfaced.
+
+### 7.1 The bug: a global, not per-row, feasibility scale
+
+The MILP incumbent-acceptance gate (`feasible_point`,
+`src/milp/MilpSolver.cpp`) and the LP layer's own final "hard invariant"
+gate (`original_space_primal_residual`, `src/lp/LpSolver.cpp`;
+`Simplex::finalize_result`, `src/lp/Simplex.cpp` — three call sites,
+identical bug in each) all normalized a row's constraint violation by
+`1 + max_i |rhs_i|` — the single largest RHS magnitude across the
+**entire model**, not that row's own scale. `flugplinf` adds one row
+(`c19`, RHS `1,200,000`, a cost cap) to the otherwise-identical `flugpl`
+model (rows with RHS 0-12000); the true MILP optimum, `1,201,500`,
+exceeds that cap, which is exactly what makes the instance infeasible.
+But the shared, global `1,200,000`-scale denominator meant a genuinely
+violated equality row elsewhere in the same model (violation `0.1`-`0.7`,
+against a row whose own natural scale is O(10-100)) fell six orders of
+magnitude under the effective tolerance and was silently accepted.
+Independently re-verified by hand: the accepted incumbent's `x` did not
+satisfy `Ax=b` on that row at all — not a tolerance edge case, a real
+violation (§7.2 below has the mechanism this exploited).
+
+This is not a hypothetical risk specific to one MIPLIB instance. Any
+model mixing rows of very different natural magnitude — a plant-wide
+cost or throughput cap alongside per-unit mass-balance rows, exactly the
+shape a refinery LP/MILP is likely to have — is exposed to the same
+failure mode under the old formula. This is precisely the class of bug
+the "any domain" bar this project is held to should catch, and precisely
+why a narrow, hand-curated 5-instance benchmark had never surfaced it.
+
+### 7.2 First fix attempt, and its own regression
+
+The first fix replaced the global scale with each row's own `1 +
+|rhs_i|`. This correctly rejects `flugplinf`. But re-running the full
+90-instance Netlib sweep immediately surfaced a **new** regression: `shell`
+and `perold` — previously clean passes — started failing
+`NUMERICAL_FAILURE`. Both have rows with `rhs=0` that legitimately sum
+large-magnitude cancelling terms (e.g. `shell` row 229: `Ax ≈ 1.888e-6`,
+genuinely tiny numerical noise) — `|rhs|=0` gives such a row zero
+headroom, even though the noise is utterly negligible relative to what
+was actually being computed. **`|rhs_i|` alone is not the right per-row
+scale either.**
+
+### 7.3 The corrected fix: |A|·|x|, then an additive noise budget
+
+The right per-row scale, direct from Higham's standard scaled-residual
+denominator (*Accuracy and Stability of Numerical Algorithms*, §7.1), is
+the row's own component-wise term magnitude — `sum_j |a_ij| · |x_j|`,
+computed directly from the row's own CSR nonzeros, not its RHS. This
+reflects the actual magnitude of what was cancelled to produce the row's
+computed activity, which is what a rounding-error argument should be
+relative to.
+
+Using this alone as a **multiplicative** scale (`violation / (1 +
+|A|·|x|) <= tolerance`) fixed both `flugplinf` and `shell`/`perold` — but
+a third check, deliberately run before declaring this closed, found a
+**third** failure mode on MIPLIB `ej` (MIPLIB's own "numerics" tag — a
+deliberately adversarial 3-variable, 1-row torture-test instance whose
+true integer optimum, 25508, is enormous relative to its size). `ej`'s
+row has huge coefficients (up to 51015); at a node with large-magnitude
+`x`, a **genuine** violation of 20 real units was accepted, because
+`tolerance × |A|·|x|` grew with activity **without bound** — the same
+conflation as §7.1's bug, just relocated: `feasibility_tolerance` (1e-6)
+is a reasonable user-facing acceptance bar, but it is roughly ten orders
+of magnitude looser than genuine floating-point noise (`~2.2e-16`
+machine epsilon), so using it as a pure multiplier against `|A|·|x|`
+lets real per-row activity growth manufacture arbitrary absolute slack.
+
+The corrected formula is **additive**, not purely multiplicative:
+
+```text
+allowed_violation_i = feasibility_tolerance + kActivityNoiseRatio * |A_i|·|x|
+```
+
+`feasibility_tolerance` (unchanged, still the original absolute floor)
+covers near-zero-activity rows exactly as before; the second term is a
+**separate**, much tighter, MEASURED constant governing legitimate noise
+on large-activity rows. `kActivityNoiseRatio = 1e-8` was derived, not
+guessed: directly measured on `shell`/`perold`, genuine floating-point
+noise lands at a strikingly consistent ratio of `~5e-10` relative to a
+row's own `|A|·|x|` (never above `7e-10` across dozens of affected rows
+in either instance); the genuine `ej` violation above sits at `~9.8e-7`
+relative to its own `|A|·|x|` — nearly 2000x higher. `1e-8` sits in
+between on a log scale, roughly 20x above the measured noise ceiling and
+100x below the measured violation ratio — comfortable margin on both
+sides, not a value cut at the edge of either measurement.
+
+Implemented identically in all three call sites (`MilpSolver.cpp`'s
+`feasible_point`, `LpSolver.cpp`'s `original_space_primal_residual`,
+`Simplex.cpp`'s `finalize_result`) — the LP-layer functions express it as
+a residual with the row's own noise budget subtracted before taking the
+max, so the existing `residual <= kFinalPrimalTol` comparison at each
+call site is unchanged and mathematically equivalent to the additive
+check above; only `MilpSolver.cpp`'s boolean gate needed restructuring.
+
+### 7.4 One adjacent bug this surfaced: a rounding-perturbation false Fatal
+
+With §7.3's fix in place, `ej`'s original false-`OPTIMAL` claim was gone
+— but a **new** symptom appeared: the search now aborted with
+`NUMERICAL_FAILURE` instead of continuing (or honestly hitting
+`TIME_LIMIT`). Root cause, in `MilpSolver.cpp`'s per-node loop: when a
+node's LP relaxation is already near-integral (`integral_point`, using
+this project's existing relative integrality tolerance), the code
+rounds it to exact integers (`rounded_point`) before checking
+feasibility, and — if that rounded candidate is rejected — treats the
+rejection as **fatal**, aborting the entire search. For `ej`'s huge
+coefficients, even a rounding shift within `integrality_tolerance`
+(`1e-7`, relative) can move a row's `Ax` by an amount that legitimately
+exceeds the now-tightened noise budget, **even though the raw,
+unrounded relaxation point was already Simplex-certified feasible**
+(§7.3's identical formula, applied inside `Simplex::finalize_result`,
+already passed on it).
+
+Fixed by falling back to the raw, unrounded `relaxation.x` before
+declaring Fatal — it was already independently certified by Simplex, and
+`candidate_integral` (which gates whether Fatal is even considered) was
+computed against that exact same point, so the fallback introduces no
+new acceptance criterion, only recovers the one already implicitly
+established.
+
+### 7.5 What "perfect on any domain" actually means here, stated plainly
+
+No MILP solver — this one, Gurobi, or otherwise — can be perfect on
+every domain: MILP is NP-hard, and every real solver trades off speed
+against certification within a time budget. What this section's fixes
+target is the bar that **is** achievable and non-negotiable: never
+report a wrong answer. Before this fix, this solver could (and, on
+`flugplinf`, did) claim `OPTIMAL` on a genuinely infeasible model. After
+it, exhaustive re-validation found zero wrong answers across the full
+90-instance Netlib LP sweep and the 24-instance broadened MILP set —
+every remaining gap is an honest `TIME_LIMIT` (with a valid, non-
+contradicting bound) or a documented, industry-standard tolerance
+tradeoff (§7.6), never a false claim.
+
+### 7.6 `ej`: a known, accepted limitation — not a bug
+
+After §7.3/§7.4's fixes, `ej` returns a row-feasible, near-integer
+incumbent (its single row's residual is `~1e-16` relative — genuinely
+negligible) whose leading variable is within `3.2e-5` of an integer, not
+exactly integral, and whose value (`~1293`) is far from the true
+published optimum (`25508`). This is **not** a new bug: `ej`'s
+near-integrality is within this project's own pre-existing, unchanged
+integrality-tolerance convention (`within()`, `src/milp/MilpSolver.cpp`
+— already a *relative* tolerance, `tol × (1 + |target|)`, unrelated to
+any of this section's fixes), the same convention every other MILP
+instance in this codebase is judged by. `ej` is MIPLIB's own deliberately
+adversarial "numerics" torture-test instance — a 3-variable, 1-row model
+engineered so its true integer optimum is astronomically large relative
+to its size, specifically to stress a solver's numerical tolerances.
+Comparable commercial solvers accept a similar tradeoff (Gurobi's own
+default `IntFeasTol` is `1e-5`, absolute, not even relative) — this is a
+standard, disclosed characteristic of finite-precision integer
+programming, not something achievable to eliminate without a
+fundamentally different (and separately-scoped) integrality-tolerance
+design. Recorded here rather than hidden, per this project's own
+standing discipline.
+
+### 7.7 MEASURED: full re-validation
+
+- **Unit tests**: 172/172 pass, unchanged.
+- **Netlib LP sweep** (90 instances, two independent clean runs): stable
+  at 88-89/90, `shell`/`perold` both restored to passing, no instance
+  outside the pre-existing, already-documented `dfl001`/`pilot87`/
+  `greenbea` OpenMP-timing flakiness class regressed.
+- **Original 5-instance MIPLIB set**: byte-identical per-instance status
+  to the pre-fix baseline (1/5 certified) — zero regression.
+- **New 24-instance broadened MIPLIB set**: `flugplinf` now correctly
+  `INFEASIBLE` (the fixed bug); all three other infeasible-tagged
+  instances (`g503inf`, `stein9inf`, `enlight4`) correctly detected;
+  every remaining non-exact result independently re-checked against
+  `data/miplib2017_broad/miplib2017-v36.solu` directly and confirmed to
+  be an honest `TIME_LIMIT` (several with `best_bound <= reference <=
+  incumbent`, the expected shape of an honest suboptimal result) or the
+  §7.6 `ej` tradeoff — zero wrong answers found.

@@ -98,6 +98,23 @@ struct MilpSolverOptions {
     // effect on plain LP callers, which never populate `integer_columns`.
     bool enable_integer_bound_rounding = true;
 
+    // GCD-based row tightening (docs/architecture/MILP.md \S1.4b;
+    // src/lp/Presolve.{hpp,cpp}'s `enable_gcd_tightening` parameter): for a
+    // row where every active coefficient is integer and every active
+    // column is integer-restricted, tightens the row's bounds to the
+    // nearest reachable multiple of gcd(|a_j|), detecting a row-level
+    // infeasibility directly when no such multiple exists. Built against
+    // this project's own stated next roadmap item (docs/ROADMAP_STATUS.md,
+    // "coefficient tightening / GCD-based reductions"), aimed at
+    // `markshare2`-class rows: large integer-valued coefficients over
+    // 0-1/general-integer columns. Unconditionally sound, like
+    // `enable_integer_bound_rounding` above, and shares that flag's
+    // `integer_columns` mask (populated whenever either flag is set --
+    // see below). Default false pending a KPI-gate benchmark on
+    // bench_miplib, matching this project's own rule for every new
+    // reduction.
+    bool enable_gcd_tightening = false;
+
     // Warm-started dual simplex for node relaxations (docs/architecture/
     // LP.md \S1/\S2, MILP.md's stated prerequisite): a non-root node
     // solves its LP relaxation by seating its parent's terminal basis and
@@ -109,6 +126,45 @@ struct MilpSolverOptions {
     // start (the root solve goes through solve_lp's presolve, which a
     // warm basis is not guaranteed to remain valid under).
     bool warm_start_node_relaxations = false;
+
+    // Caps how many parent bases are retained at once for warm starting.
+    //
+    // Every OPEN node carries a shared_ptr to its parent's terminal basis
+    // (SearchNode::parent_basis), so live-basis memory scales with FRONTIER
+    // SIZE -- not with tree depth, and not with the number of nodes already
+    // processed. On an instance whose LP bound prunes almost nothing the
+    // frontier grows without limit, and so did this: MEASURED on markshare2
+    // (dual bound pinned at 0, so essentially nothing is ever pruned) at
+    // ~150 MB/s, reaching 13.5 GB in 90 s at 8 workers, against ~10 MB/s for
+    // the same run with warm starting off. An earlier 16-worker run reached
+    // 17 GB RSS and had to be killed.
+    //
+    // Once this many bases are live, no NEW one is retained and those nodes
+    // take the cold-solve path instead -- already the tested behaviour
+    // whenever a parent basis is absent (see
+    // milp_warm_start_fallback_counter_is_zero_or_explained). So this
+    // degrades a heuristic speedup under memory pressure; it never changes
+    // which nodes are pruned, the final status, or the reported objective.
+    // Zero means unlimited (the pre-cap behaviour).
+    std::uint64_t max_live_warm_start_bases = 100000;
+
+    // Opt-in exact meet-in-the-middle path for "binary system with unit
+    // slacks" models -- the market-split / multi-knapsack shape
+    // (src/milp/ExactBinarySplit.hpp has the full structural contract and
+    // the argument for why it exists). Off by default and gated on
+    // STRUCTURE, never on an instance name: a model that is not exactly
+    // that shape, or that would exceed the memory budget below, silently
+    // falls through to ordinary branch-and-bound.
+    //
+    // It exists because LP-based B&B is provably the wrong tool for this
+    // shape: the relaxation attains slack 0 fractionally, so the dual bound
+    // sits at 0 and never moves. MEASURED on markshare2: bound exactly
+    // 0.00000000 after 8.68M nodes. The enumeration is complete, so its
+    // answer is a proof rather than a best effort -- but it is exponential
+    // in n/2 and therefore never enabled implicitly.
+    bool enable_exact_binary_split = false;
+    std::uint64_t exact_binary_split_memory_bytes = 6ull << 30;
+    std::uint32_t exact_binary_split_threads = 0; // 0 = hardware_concurrency/2
 
     // Parallel branch-and-bound (src/milp/ParallelSearch.hpp,
     // docs/architecture/MILP.md's parallel-B&B section): the root node is
