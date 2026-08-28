@@ -1,0 +1,12 @@
+{
+  "gurobi_version": "(13, 0, 3)",
+  "gurobi_license": "restricted (no-registration, free trial), non-production, <=2000x2000",
+  "instances_compared": 5,
+  "best_incumbent_per_instance": {
+    "gen-ip002": "ours",
+    "gen-ip054": "gurobi",
+    "markshare2": "gurobi",
+    "neos859080": null,
+    "pk1": "gurobi"
+  }
+}

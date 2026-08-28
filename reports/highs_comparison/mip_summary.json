@@ -1,6 +1,6 @@
 {
   "highs_version": "HiGHS version 1.15.1 Githash 73cac48. Copyright (c) 2026 under MIT licence terms\nIncludes third-party software components, see THIRD_PARTY_NOTICES.md for full details",
-  "git_commit": "4f83aa2 (dirty)",
+  "git_commit": "431b94d (dirty)",
   "time_limit_seconds": 60.0,
   "instances_compared": 5,
   "ours_certified_optimal": 0,

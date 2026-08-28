@@ -4,13 +4,13 @@
   "instances_in_cap": 63,
   "instances_total": 90,
   "three_way_objective_agreement": 61,
-  "total_seconds_ours": 4.723631157,
-  "total_seconds_highs": 0.7500000000000001,
-  "total_seconds_gurobi": 0.4564105469999049,
+  "total_seconds_ours": 3.561333231,
+  "total_seconds_highs": 0.6900000000000001,
+  "total_seconds_gurobi": 0.4599365049980406,
   "fastest_count": {
     "ours": 1,
-    "highs": 27,
-    "gurobi": 33
+    "highs": 29,
+    "gurobi": 31
   },
   "ours_beats_both_count": 1
 }
