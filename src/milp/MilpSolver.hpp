@@ -131,7 +131,22 @@ struct MilpSolverOptions {
     // this project's own standing rule that a new lever ships off by
     // default until MEASURED to help (enable_root_gmi_cuts,
     // use_rens_heuristic, warm_start_node_relaxations above all follow the
-    // same pattern). 0 means "auto": min(4, hardware_concurrency).
+    // same pattern). 0 means "auto": min(8, hardware_concurrency).
+    //
+    // MEASURED (docs/architecture/MILP.md \S6.5) on the 5-instance MIPLIB
+    // set, single process: worker counts 1/4/8/16 all showed positive,
+    // no-regression scaling on this 16-logical-core machine, with the
+    // practically significant result at exactly 8 workers -- pk1 goes
+    // from TIME_LIMIT (obj 44) to CERTIFIED OPTIMAL (obj 11, exact), not
+    // just faster. 16 workers kept helping (pk1 certified even faster,
+    // 28.3s vs 45.2s) but with clearly diminishing marginal throughput
+    // gains over 8 (roughly 20-45% further gain vs. 8's own ~1.6-2.9x
+    // gain over 4), consistent with 16 worker threads leaving zero
+    // headroom for OS/other threads on a 16-logical-core box. `auto`'s
+    // cap is set to 8, not 16, specifically so it stays a reasonable
+    // default across machines smaller than this one, rather than
+    // asserting "use every core" -- an explicit worker count remains the
+    // right choice on a box known to have more headroom.
     //
     // Node exploration ORDER and node COUNT become inherently
     // nondeterministic above 1 (thread-scheduling-dependent) -- a real,

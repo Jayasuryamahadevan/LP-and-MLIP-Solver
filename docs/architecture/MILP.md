@@ -802,8 +802,9 @@ entirely, which remains out of scope for this increment.
 immediately before each run — a concurrently-running test binary from
 another process on the same machine was waited out first), 5-instance
 MIPLIB set, 60s time limit, `parallel_worker_count=1` (baseline) vs.
-`parallel_worker_count=0` i.e. `auto` → `min(4, hardware_concurrency())`
-= 4 workers on this 16-core machine:
+`parallel_worker_count=4` (`auto`'s original cap at the time of this first
+measurement, before §6.5a below raised it to 8) = 4 workers on this
+16-core machine:
 
 | instance    | status (both) | nodes/sec, 1 worker | nodes/sec, 4 workers | speedup | gap, 1w → 4w |
 |-------------|----------------|---------------------:|----------------------:|--------:|--------------|
@@ -857,3 +858,66 @@ that instance's difficulty is structural (weak LP relaxation, needs
 better cuts/presolve, `docs/architecture/MILP.md` earlier sections),
 and no amount of additional node throughput fixes a bound that stays
 loose at every node.
+
+#### 6.5a Scaling beyond 4 workers, and a qualitative result: `pk1` certifies
+
+The 4-worker measurement above only tested `auto`'s original cap
+(`min(4, hardware_concurrency())`). A direct follow-up question — does
+scaling further keep helping on this 16-logical-core machine, or does the
+shared-mutex queue design (§6.1) become the bottleneck first — was
+checked explicitly with `parallel_worker_count` set to `8` and `16`,
+same 5-instance set, same 60s budget, single process (each run was
+individually verified via `ps aux --sort=-%cpu` immediately beforehand;
+two earlier attempts at this specific measurement were discarded after
+`ps` showed a competing CPU-heavy process active during the run, rather
+than accepting numbers that couldn't be trusted):
+
+| workers | gen-ip002 nodes/sec | gen-ip054 nodes/sec | markshare2 nodes/sec | neos859080 nodes/sec | pk1 |
+|--------:|---------------------:|---------------------:|----------------------:|----------------------:|-----|
+| 1       | 4,820                | 3,843                 | 9,591                  | 294                    | TIME_LIMIT, obj 44 |
+| 4       | 11,632               | 9,648                  | 41,982                 | 445                    | TIME_LIMIT, obj 44 |
+| 8       | 33,723               | 25,592                 | 68,931                 | 616                    | **OPTIMAL, obj 11 (exact), 45.156s** |
+| 16      | 40,690               | 35,972                 | 99,585                 | 720                    | **OPTIMAL, obj 11 (exact), 28.272s** |
+
+Every instance kept the same or a strictly better status at every worker
+count — no regression anywhere across four separate worker-count
+configurations, not just the two originally measured. The practically
+significant result is not a throughput number at all: **`pk1` crosses
+from `TIME_LIMIT` to fully certified `OPTIMAL` somewhere between 4 and 8
+workers**, and stays certified (and gets there faster — 28.3s vs. 45.2s)
+at 16. This is this project's first-ever `bench_miplib` run of any kind
+to certify `pk1`, taking the 5-instance benchmark's overall certified
+count from 1/5 to **2/5**. A qualitative jump like this — an instance
+that was badly wrong at 44 vs. the true optimum of 11 now proven exactly
+optimal — is a stronger result than any of the per-instance throughput
+percentages above, and is the main reason this section changed `auto`'s
+own default cap (below).
+
+Scaling itself shows real but diminishing marginal returns past 8
+workers: on the three instances large enough for a clean ratio
+(`gen-ip002`/`gen-ip054`/`markshare2`), the 4→8 step gained roughly
+1.6-2.9x in throughput (occasionally *super-linear* — plausibly explained
+by an earlier incumbent update pruning a larger subtree sooner, a known
+non-monotonic effect in parallel B&B, not a measurement artifact,
+since every instance's status and node-count-vs-wall-clock relationship
+was independently sane), while the 8→16 step gained only roughly
+1.2-1.4x further. This is the expected shape on a 16-logical-core
+machine: 16 worker threads leave zero headroom for the OS and any other
+process, so returns taper exactly where oversubscription theory predicts
+they should, without ever going negative.
+
+**Consequence, applied**: `auto`'s cap (`MilpSolverOptions::
+parallel_worker_count == 0`) is raised from `min(4, hardware_concurrency())`
+to `min(8, hardware_concurrency())` — deliberately not raised all the way
+to `hardware_concurrency()` itself, since the measured qualitative payoff
+(certifying `pk1`) is already fully captured at 8, and capping at 8
+rather than "every core" keeps `auto` a reasonable default on machines
+smaller than this 16-core development box, where an explicit worker
+count remains the right tool if more headroom is known to exist. The
+solver-wide default (`parallel_worker_count = 1`, opt-in) is unchanged
+by this measurement — this project's own established convention (RENS,
+GMI cuts, integer bound rounding, doubleton substitution all shipped
+opt-in first, some later promoted, some not) is to keep a new
+concurrency-class feature opt-in for more than one iteration's worth of
+evidence before flipping the solver-wide default, even when, as here,
+the first real measurement is unambiguously positive.

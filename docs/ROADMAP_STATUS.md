@@ -26,7 +26,7 @@ in this document is an estimate.
 | max | **25.066 s** (`stocfor3`) | JSONL |
 | total iterations | 255,144 | JSONL |
 | worst relative objective error | 5.779e-07 | JSONL |
-| MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** | `reports/runs/2026-08-25/miplib-raw.txt` |
+| MIPLIB 2017 subset (5 instances, 60s budget) certified | **1 / 5** at the shipped default (`parallel_worker_count=1`); **2 / 5** at `parallel_worker_count>=8` (`pk1` newly certifies, §Phase 3-5) | `reports/runs/2026-08-25/miplib-raw.txt`; parallel-B&B result in `docs/architecture/MILP.md` §6.5a |
 | unit tests | 165 / 165 | `ctest` (161 as of doubleton substitution + 4 parallel-B&B correctness/determinism cases) |
 
 `MEASURED`. Single process, nothing else running, build stamp
@@ -341,7 +341,25 @@ identical final status on every instance (no solvability regression), and
 real, measured progress, explicitly **not** a claim of closing the gap.
 `markshare2`'s gap (99.57%) is unchanged, as expected: that instance's
 difficulty is a weak LP relaxation, which additional node throughput alone
-cannot fix. Full account, including the corrected-in-place prediction about
+cannot fix.
+
+**Follow-up MEASURED, same iteration**: worker counts 8 and 16 were also
+benchmarked (each individually verified single-process via `ps`, two
+earlier contaminated attempts discarded rather than kept). Scaling
+continued, with diminishing but still positive marginal returns past 8
+(consistent with 16 threads leaving zero OS headroom on this 16-core
+box) — and **`pk1` crosses from `TIME_LIMIT` (obj 44) to fully certified
+`OPTIMAL` (obj 11, exact) somewhere between 4 and 8 workers**, taking
+the 5-instance benchmark's overall certified count from 1/5 to **2/5**
+for the first time in this project's history, at `parallel_worker_count
+>= 8`. On the strength of this result, `auto`'s own cap
+(`parallel_worker_count=0`) was raised from `min(4, hardware_concurrency())`
+to `min(8, hardware_concurrency())` — deliberately not to "every core,"
+so `auto` stays a sane default on smaller machines too. The solver-wide
+default stays `parallel_worker_count=1` (opt-in), unchanged, matching
+this project's own convention of a longer soak period before flipping a
+concurrency-class feature on by default, even given an unambiguously
+positive first result. Full account, including the corrected-in-place prediction about
 which instance would benefit least (it was `markshare2`; measured, it
 benefited most), in `docs/architecture/MILP.md` §6.
 
@@ -484,10 +502,16 @@ was measured end to end (`docs/architecture/LP.md` §8) and did not clear the
 KPI gate, so it ships off by default; the B&B exists but is not yet
 benchmark-ready, which is now the top item below.
 
-1. **Close the MILP benchmark gap — still open.** 1/5 certified and 3/5
-   badly wrong incumbents on the 5-instance MIPLIB set within a 60 s
-   budget (`reports/runs/2026-08-25/miplib-raw.txt`) is the real open MILP
-   item — ahead of any further heuristics or symmetry work. Diagnosed
+1. **Close the MILP benchmark gap — partially closed, still open overall.**
+   1/5 certified and 3/5 badly wrong incumbents on the 5-instance MIPLIB set
+   within a 60 s budget (`reports/runs/2026-08-25/miplib-raw.txt`) was the
+   original diagnosis. **Update**: `pk1` (one of the 3 "badly wrong"
+   instances) is now certified `OPTIMAL` — not via a new cut or heuristic,
+   but via raw node throughput at `parallel_worker_count>=8` (item 10
+   below, `docs/architecture/MILP.md` §6.5a). This is real progress, not a
+   substitute for the diagnosis that follows, which still holds for
+   `markshare2` and (at the shipped `parallel_worker_count=1` default)
+   `gen-ip002`/`gen-ip054` too. Diagnosed
    (three independent passes: instance-difficulty research, cover-cut
    correctness audit, B&B bound-tracking audit — all in this repository's
    history, no fresh citation needed here): `markshare2`'s badness is
@@ -668,8 +692,14 @@ benchmark-ready, which is now the top item below.
     OpenMP configuration accordingly, rather than relying on a suppression
     file that turned out not to work. Unlike items 7-9 above, this is not a
     null result — it is this session's first MILP-side change that actually
-    moves a benchmark KPI in the intended direction. Full account in
-    `docs/architecture/MILP.md` §6.
+    moves a benchmark KPI in the intended direction. **Follow-up same
+    iteration**: 8- and 16-worker scaling measured too — `pk1` crosses from
+    `TIME_LIMIT` to fully certified `OPTIMAL` at >=8 workers (5-instance
+    certified count 1/5 → 2/5 for the first time), with diminishing but
+    still-positive returns out to 16. `auto`'s cap raised from `min(4,
+    hardware_concurrency())` to `min(8, ...)` on the strength of this;
+    solver-wide default stays `1` (opt-in). Full account in
+    `docs/architecture/MILP.md` §6, §6.5a.
 
 The governing rule stands: *no optimization is accepted unless it improves a
 declared benchmark KPI without reducing correctness or solvability.* Two changes

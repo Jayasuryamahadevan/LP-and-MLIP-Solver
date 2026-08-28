@@ -1366,7 +1366,7 @@ MilpSolution solve_milp(const MilpProblem& problem, const MilpSolverOptions& opt
 
     const std::uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
     const std::uint32_t n_workers =
-        options.parallel_worker_count == 0 ? std::min(4u, hw) : options.parallel_worker_count;
+        options.parallel_worker_count == 0 ? std::min(8u, hw) : options.parallel_worker_count;
     // Force SERIAL per-node LP solves whenever more than one thread will
     // ever touch this search (including the mandatory serial root phase,
     // so root and workers behave identically) -- see
