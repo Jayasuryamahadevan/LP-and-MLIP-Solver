@@ -438,7 +438,11 @@ On a broadened 24-instance structurally diverse MIPLIB subset: **0 wrong answers
 
 ### Build
 
+From a fresh checkout:
+
 ```bash
+git clone https://github.com/Jayasuryamahadevan/LP-and-MLIP-Solver.git
+cd LP-and-MLIP-Solver
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ```
@@ -456,8 +460,11 @@ Options: `-DSIHPS_BUILD_TESTS=OFF`, `-DSIHPS_BUILD_BENCHMARKS=OFF`.
 ### Test
 
 ```bash
-cd build && ctest --output-on-failure
+ctest --test-dir build --output-on-failure
 ```
+
+This keeps the shell at the repository root so the `./build/benchmarks/`
+and `data/` paths in the next section resolve correctly.
 
 <img src="https://capsule-render.vercel.app/api?type=rect&color=0:1F6FEB,100:0B1120&height=3&section=header" width="100%" alt="" />
 
